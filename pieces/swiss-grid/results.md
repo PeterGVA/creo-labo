@@ -11,3 +11,4 @@ Label is the letter shown in the gallery (see `index.html`).
 | D     | Sonnet |         |            |          |
 | E     | Haiku 5.5 solo |   |            |          |
 | F     | Sonnet 5.5 solo |   |            |          |
+| G     | Opus 5.5 solo |   |            |          |
