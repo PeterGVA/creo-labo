@@ -1,0 +1,107 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Swiss Grid: model comparison</title>
+<style>
+  /* Plain white page, dark text, system fonts only. */
+  body { margin: 0; padding: 24px; background: #fff; color: #111;
+         font-family: Helvetica, Arial, sans-serif; }
+  header { display: flex; justify-content: space-between; align-items: center;
+           margin-bottom: 24px; }
+  h1 { font-size: 18px; font-weight: normal; margin: 0; }
+  button { font: inherit; padding: 8px 16px; border: 1px solid #111;
+           background: #fff; color: #111; cursor: pointer; }
+  button:hover { background: #111; color: #fff; }
+
+  /* Four equal columns side by side; they wrap on narrow screens. */
+  #gallery { display: grid; gap: 16px;
+             grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); }
+
+  /* Each card holds a label and a box with the 1080x1350 (4:5) shape. */
+  .label { font-size: 14px; margin-bottom: 6px; }
+  .box { aspect-ratio: 1080 / 1350; border: 1px solid #ddd; background: #fff;
+         position: relative; }
+  .box iframe { width: 100%; height: 100%; border: 0; display: block; }
+  .empty { position: absolute; inset: 0; display: flex; align-items: center;
+           justify-content: center; color: #888; font-size: 14px; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Swiss Grid: which setup made which?</h1>
+  <button id="reveal">Reveal</button>
+</header>
+
+<div id="gallery"></div>
+
+<script>
+  // The four setups = the four folder names inside pieces/swiss-grid/.
+  // The order below is the shuffle: A is team, B is opus, C is haiku, D is sonnet.
+  // It is written out by hand (not random) so the labels stay the same on every visit.
+  // To reshuffle, change the order of this list.
+  var versions = [
+    { label: "A", folder: "team",   name: "Team" },
+    { label: "B", folder: "opus",   name: "Opus" },
+    { label: "C", folder: "haiku",  name: "Haiku" },
+    { label: "D", folder: "sonnet", name: "Sonnet" }
+  ];
+
+  var gallery = document.getElementById("gallery");
+  var revealed = false;      // starts hidden; the button flips it
+  var labelEls = [];         // remember each label element so Reveal can edit it
+
+  // Build one card (label + box) for every version.
+  versions.forEach(function (v) {
+    var card = document.createElement("div");
+
+    var label = document.createElement("div");
+    label.className = "label";
+    label.textContent = v.label;
+    labelEls.push(label);
+
+    var box = document.createElement("div");
+    box.className = "box";
+
+    card.appendChild(label);
+    card.appendChild(box);
+    gallery.appendChild(card);
+
+    var url = "pieces/swiss-grid/" + v.folder + "/index.html";
+
+    // Show the animation in an iframe (a page inside the page).
+    function showFrame() {
+      var f = document.createElement("iframe");
+      f.src = url;
+      f.title = "Version " + v.label;
+      box.appendChild(f);
+    }
+    // Show a grey "not built yet" message instead.
+    function showEmpty() {
+      var e = document.createElement("div");
+      e.className = "empty";
+      e.textContent = "not built yet";
+      box.appendChild(e);
+    }
+
+    // Ask the server whether the file exists.
+    // If the check itself fails (e.g. you opened this file straight from disk,
+    // where browsers block the check), we just try the iframe anyway.
+    fetch(url, { method: "HEAD" })
+      .then(function (r) { r.ok ? showFrame() : showEmpty(); })
+      .catch(showFrame);
+  });
+
+  // The Reveal button toggles between "A" and "A: Team".
+  document.getElementById("reveal").addEventListener("click", function () {
+    revealed = !revealed;
+    versions.forEach(function (v, i) {
+      labelEls[i].textContent = revealed ? v.label + ": " + v.name : v.label;
+    });
+    this.textContent = revealed ? "Hide" : "Reveal";
+  });
+</script>
+</body>
+</html>
