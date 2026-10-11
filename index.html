@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Swiss Grid: model comparison</title>
+<title>Swiss pieces: model comparison</title>
 <style>
   /* Plain white page, dark text, system fonts only. */
   body { margin: 0; padding: 24px; background: #fff; color: #111;
@@ -15,8 +15,12 @@
            background: #fff; color: #111; cursor: pointer; }
   button:hover { background: #111; color: #fff; }
 
+  /* A title above each row, with space between the two rows. */
+  h2 { font-size: 16px; font-weight: normal; margin: 32px 0 12px; }
+  h2:first-of-type { margin-top: 0; }
+
   /* Four equal columns side by side; they wrap on narrow screens. */
-  #gallery { display: grid; gap: 16px;
+  .gallery { display: grid; gap: 16px;
              grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); }
 
   /* Each card holds a label and a box with the 1080x1350 (4:5) shape. */
@@ -31,14 +35,19 @@
 <body>
 
 <header>
-  <h1>Swiss Grid: which setup made which?</h1>
+  <h1>Swiss pieces: which setup made which?</h1>
   <button id="reveal">Reveal</button>
 </header>
 
-<div id="gallery"></div>
+<!-- Row 1: the first round. Row 2: the second round. Both are filled in by the script below. -->
+<h2>Round 1 – Swiss Grid</h2>
+<div class="gallery" id="gallery1"></div>
+
+<h2>Round 2 – Swiss Hero Spot</h2>
+<div class="gallery" id="gallery2"></div>
 
 <script>
-  // The four setups = the four folder names inside pieces/swiss-grid/.
+  // Round 1: the four setups = the four folder names inside pieces/swiss-grid/.
   // The order below is the shuffle: A is team, B is opus, C is haiku, D is sonnet.
   // It is written out by hand (not random) so the labels stay the same on every visit.
   // To reshuffle, change the order of this list.
@@ -49,52 +58,72 @@
     { label: "D", folder: "sonnet", name: "Sonnet" }
   ];
 
-  var gallery = document.getElementById("gallery");
+  // Round 2: the four setups, in a fixed order (no shuffling).
+  // Each label is simply the folder name, so nothing is hidden.
+  var heroVersions = [
+    { label: "opus-high",   folder: "opus-high" },
+    { label: "sonnet-high", folder: "sonnet-high" },
+    { label: "haiku-high",  folder: "haiku-high" },
+    { label: "opus-medium", folder: "opus-medium" }
+  ];
+
   var revealed = false;      // starts hidden; the button flips it
-  var labelEls = [];         // remember each label element so Reveal can edit it
+  var labelEls = [];         // remember Round 1 label elements so Reveal can edit them
 
-  // Build one card (label + box) for every version.
-  versions.forEach(function (v) {
-    var card = document.createElement("div");
+  // buildRow fills one row: for every version it makes a label + a box,
+  // then shows the animation (or "not built yet" if the file is missing).
+  //   galleryId = which row to fill
+  //   piece     = the folder under pieces/ (e.g. "swiss-grid")
+  //   list      = the versions to show
+  //   track     = true if the labels should be remembered for the Reveal button
+  function buildRow(galleryId, piece, list, track) {
+    var gallery = document.getElementById(galleryId);
 
-    var label = document.createElement("div");
-    label.className = "label";
-    label.textContent = v.label;
-    labelEls.push(label);
+    list.forEach(function (v) {
+      var card = document.createElement("div");
 
-    var box = document.createElement("div");
-    box.className = "box";
+      var label = document.createElement("div");
+      label.className = "label";
+      label.textContent = v.label;
+      if (track) labelEls.push(label);
 
-    card.appendChild(label);
-    card.appendChild(box);
-    gallery.appendChild(card);
+      var box = document.createElement("div");
+      box.className = "box";
 
-    var url = "pieces/swiss-grid/" + v.folder + "/index.html";
+      card.appendChild(label);
+      card.appendChild(box);
+      gallery.appendChild(card);
 
-    // Show the animation in an iframe (a page inside the page).
-    function showFrame() {
-      var f = document.createElement("iframe");
-      f.src = url;
-      f.title = "Version " + v.label;
-      box.appendChild(f);
-    }
-    // Show a grey "not built yet" message instead.
-    function showEmpty() {
-      var e = document.createElement("div");
-      e.className = "empty";
-      e.textContent = "not built yet";
-      box.appendChild(e);
-    }
+      var url = "pieces/" + piece + "/" + v.folder + "/index.html";
 
-    // Ask the server whether the file exists.
-    // If the check itself fails (e.g. you opened this file straight from disk,
-    // where browsers block the check), we just try the iframe anyway.
-    fetch(url, { method: "HEAD" })
-      .then(function (r) { r.ok ? showFrame() : showEmpty(); })
-      .catch(showFrame);
-  });
+      // Show the animation in an iframe (a page inside the page).
+      function showFrame() {
+        var f = document.createElement("iframe");
+        f.src = url;
+        f.title = v.label;
+        box.appendChild(f);
+      }
+      // Show a grey "not built yet" message instead.
+      function showEmpty() {
+        var e = document.createElement("div");
+        e.className = "empty";
+        e.textContent = "not built yet";
+        box.appendChild(e);
+      }
 
-  // The Reveal button toggles between "A" and "A: Team".
+      // Ask the server whether the file exists.
+      // If the check itself fails (e.g. you opened this file straight from disk,
+      // where browsers block the check), we just try the iframe anyway.
+      fetch(url, { method: "HEAD" })
+        .then(function (r) { r.ok ? showFrame() : showEmpty(); })
+        .catch(showFrame);
+    });
+  }
+
+  buildRow("gallery1", "swiss-grid", versions, true);
+  buildRow("gallery2", "swiss-hero", heroVersions, false);
+
+  // The Reveal button (Round 1 only) toggles between "A" and "A: Team".
   document.getElementById("reveal").addEventListener("click", function () {
     revealed = !revealed;
     versions.forEach(function (v, i) {
