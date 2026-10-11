@@ -1,0 +1,529 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Swiss Hero Spot</title>
+<style>
+  /* The page is pure black; the canvas sits in the middle, scaled to fit. */
+  html, body { margin: 0; height: 100%; background: #000000; overflow: hidden; }
+  body { display: flex; align-items: center; justify-content: center; }
+  /* The canvas always draws at 1080x1350; CSS only changes its displayed size. */
+  canvas { display: block; background: #ffffff; }
+</style>
+</head>
+<body>
+<canvas id="c" width="1080" height="1350"></canvas>
+<script>
+/* =====================================================================
+   SWISS HERO SPOT — 16 seconds, 90 BPM, 4/4, six acts of one bar each.
+
+   The one big idea: every frame is drawn by render(t), where t is the
+   time in seconds (0 to 16). render() never remembers anything from the
+   previous frame. Given the same t it always draws the same picture.
+   That is what "a pure function of t" means, and it is why the loop is
+   perfect and why window.seek(t) can jump anywhere instantly.
+   ===================================================================== */
+
+// ---------- 1. Basic numbers: picture size, music, grid -------------------
+
+const W = 1080, H = 1350;          // picture size in pixels (portrait)
+const LOOP = 16;                   // the whole spot lasts 16 seconds
+const BEAT = 60 / 90;              // 90 beats per minute -> 0.667 s per beat
+const BAR = BEAT * 4;              // 4 beats per bar -> 2.667 s per bar
+
+// Colours. Core palette + the serial sequence used only in Act 5.
+const WHITE = '#ffffff', BLACK = '#111111', RED = '#e30613';
+const SERIES = ['#e30613', '#ff6a00', '#ffd200', '#00a651', '#0057b8', '#5b2c86'];
+
+// The grid: 6 columns x 8 rows inside 60 px margins.
+// Column width = (1080 - 2*60) / 6 = 160.  Row height = (1350 - 2*60) / 8 = 153.75.
+const MARGIN = 60;
+const COLW = (W - 2 * MARGIN) / 6;   // 160
+const ROWH = (H - 2 * MARGIN) / 8;   // 153.75
+const colX = i => MARGIN + COLW * i; // x of vertical grid line i (0..6)
+const rowY = j => MARGIN + ROWH * j; // y of horizontal grid line j (0..8)
+
+const FONT = '"Helvetica Neue", Helvetica, Arial, sans-serif';
+const font = (weight, size) => `${weight} ${size}px ${FONT}`;
+
+// beatTime(n) = the moment beat number n happens (beat 0 is t = 0).
+const beatTime = n => n * BEAT;
+
+// ---------- 2. Little maths helpers for motion ----------------------------
+
+const clamp01 = x => Math.max(0, Math.min(1, x));
+const lerp = (a, b, p) => a + (b - a) * p;
+const easeIn = p => p * p * p;              // starts slow, ends fast (for exits)
+const easeOut = p => 1 - Math.pow(1 - p, 3); // starts fast, ends slow
+
+/* hit(t, tb): the heart of the "music rules".
+   Returns 0 well before the beat, then climbs to exactly 1 AT the beat
+   (the move starts "lead" seconds early and accelerates into the hit),
+   then wobbles around 1 like a damped spring and settles.
+   Everything is computed from t alone - no stored velocity. */
+function hit(t, tb, lead = 0.12, amp = 0.12) {
+  if (t < tb - lead) return 0;
+  if (t < tb) {                       // the approach: accelerate into the beat
+    const p = (t - (tb - lead)) / lead;
+    return p * p;
+  }
+  const d = t - tb;                   // after the beat: damped spring overshoot
+  return 1 + amp * Math.exp(-9 * d) * Math.sin(20 * d);
+}
+
+// A gentler version that never goes above 1 (for things like reveals).
+const hitClamped = (t, tb, lead) => Math.min(1, hit(t, tb, lead, 0));
+
+/* inkBox(text, weight): where the real ink of some text sits, measured in
+   "font sizes" relative to the point where fillText draws it.
+   The browser's own text metrics can be several pixels off at giant sizes,
+   so we draw the text once on a hidden canvas and look at the pixels.
+   This is done once per text at start-up and kept (a cache, not animation
+   state), so render(t) stays a pure function of t.
+   Result: { left, right, top } — e.g. top = 0.72 means the ink starts
+   0.72 font-sizes above the baseline. */
+const INK = new Map();
+function inkBox(text, weight) {
+  const key = weight + '|' + text;
+  if (INK.has(key)) return INK.get(key);
+  const S = text.length > 1 ? 500 : 1000;          // measuring font size
+  const pad = S * 0.3, bw = Math.ceil(S * (text.length + 0.6)), bh = Math.ceil(S * 1.6);
+  const c = document.createElement('canvas');
+  c.width = bw; c.height = bh;
+  const g = c.getContext('2d', { willReadFrequently: true });
+  g.font = font(weight, S);
+  g.fillStyle = '#000';
+  const base = S * 1.2;
+  g.fillText(text, pad, base);
+  const px = g.getImageData(0, 0, bw, bh).data;
+  let x0 = bw, x1 = -1, y0 = bh;
+  for (let y = 0; y < bh; y++) {
+    for (let x = 0; x < bw; x++) {
+      if (px[(y * bw + x) * 4 + 3] > 127) {        // pixel is mostly inked
+        if (x < x0) x0 = x;
+        if (x > x1) x1 = x;
+        if (y < y0) y0 = y;
+      }
+    }
+  }
+  const box = { left: (x0 - pad) / S, right: (x1 + 1 - pad) / S, top: (base - y0) / S };
+  INK.set(key, box);
+  return box;
+}
+
+// Height of a capital letter as a fraction of the font size. Used so type
+// hangs exactly from grid lines whatever font the device actually has
+// (Helvetica Neue, Helvetica or Arial).
+let CAP = 0.72;
+function measureCap() { CAP = inkBox('H', 'bold').top; }
+
+// ---------- 3. Canvas setup ----------------------------------------------
+
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+measureCap();
+
+// Scale the canvas on screen to fit the window while keeping 1080x1350 shape.
+function fit() {
+  const s = Math.min(window.innerWidth / W, window.innerHeight / H);
+  canvas.style.width = Math.floor(W * s) + 'px';
+  canvas.style.height = Math.floor(H * s) + 'px';
+}
+window.addEventListener('resize', fit);
+fit();
+
+function fillBg(color) {
+  ctx.fillStyle = color;
+  ctx.fillRect(0, 0, W, H);
+}
+
+// Draw one letter so that its INK (not its invisible box) touches the
+// given left edge / right edge / cap top. Returns nothing.
+function drawGlyph(ch, size, opts) {
+  ctx.font = font('bold', size);
+  const ink = inkBox(ch, 'bold');
+  const inkW = (ink.right - ink.left) * size;
+  let left;
+  if (opts.left !== undefined) left = opts.left;
+  else if (opts.right !== undefined) left = opts.right - inkW;
+  else left = opts.centerX - inkW / 2;
+  const x = left - ink.left * size;                     // where fillText must start
+  const baseline = opts.capTop !== undefined ? opts.capTop + ink.top * size
+                                             : opts.baseline;
+  ctx.fillText(ch, x, baseline);
+}
+
+/* =====================================================================
+   THE SIX ACTS. Each one is a function that receives the global time t
+   and draws the whole picture. Act k starts at (k-1) * BAR seconds.
+   ===================================================================== */
+
+// ---------- ACT 1: GRID (0.000 – 2.667) ----------------------------------
+// Beat 1: the grid lines draw in. Beats 2, 3, 4: black modules fill
+// cells by a Gerstner-style permutation: in row r the filled column is
+// (r + k) mod 6, with k = 0, then 2, then 4. Each beat adds one family of
+// diagonals; together they build a perfect checkerboard.
+function act1(t) {
+  fillBg(WHITE);
+
+  const shifts = [0, 2, 4];
+  ctx.fillStyle = BLACK;
+  for (let k = 0; k < 3; k++) {
+    const tb = beatTime(1 + k);                      // beats 2, 3, 4
+    for (let r = 0; r < 8; r++) {
+      // lower rows start a little earlier, so the rule reads as a sweep,
+      // but every module lands exactly on the beat.
+      const s = hit(t, tb, 0.08 + (7 - r) * 0.015, 0.1);
+      if (s <= 0) continue;
+      const c = (r + shifts[k]) % 6;
+      const cx = colX(c) + COLW / 2, cy = rowY(r) + ROWH / 2;
+      ctx.fillRect(cx - COLW / 2 * s, cy - ROWH / 2 * s, COLW * s, ROWH * s);
+    }
+  }
+
+  // Grid lines: 7 vertical + 9 horizontal, each drawn quickly, slightly staggered.
+  ctx.fillStyle = BLACK;
+  const LW = 4;
+  for (let i = 0; i <= 6; i++) {
+    const p = easeOut(clamp01((t - i * 0.025) / 0.22));
+    if (p > 0) ctx.fillRect(colX(i) - LW / 2, MARGIN, LW, (H - 2 * MARGIN) * p);
+  }
+  for (let j = 0; j <= 8; j++) {
+    const p = easeOut(clamp01((t - 0.05 - j * 0.02) / 0.22));
+    if (p > 0) ctx.fillRect(MARGIN, rowY(j) - LW / 2, (W - 2 * MARGIN) * p, LW);
+  }
+}
+
+// ---------- ACT 2: CIRCLES (2.667 – 5.333) -------------------------------
+// Rings grow from the bottom-left grid corner (60, 1290). Each beat a new
+// disk is born at 4 columns of radius (640 px) and every older disk grows
+// by 2 columns (320 px). So every edge falls on a multiple of the column
+// width. Colours alternate black / white; on beat 4 ring #2 turns red.
+function act2(t) {
+  fillBg(WHITE);
+  const t0 = BAR;
+  const ox = colX(0), oy = rowY(8);
+  for (let j = 0; j < 4; j++) {                      // outermost (oldest) first
+    let r = 4 * COLW * hit(t, t0 + beatTime(j), 0.12, 0.08);
+    for (let i = j + 1; i < 4; i++) r += 2 * COLW * hit(t, t0 + beatTime(i), 0.12, 0.08);
+    if (r <= 0) continue;
+    let col = j % 2 === 0 ? BLACK : WHITE;
+    if (j === 1 && t >= t0 + beatTime(3)) col = RED; // hard colour cut on beat 4
+    ctx.fillStyle = col;
+    ctx.beginPath();
+    ctx.arc(ox, oy, r, 0, Math.PI * 2);
+    ctx.fill();
+  }
+}
+
+// ---------- ACT 3: CONTRAST (5.333 – 8.000) ------------------------------
+// Hard cut to black. One giant white letter per beat, each a different
+// extreme scale, each cropped by the frame. Beat 4: a tiny red square.
+// Every letter edge is locked to a grid line.
+const ACT3 = [
+  // R: the biggest. Left ink edge on the margin, sitting on the bottom grid
+  // line, so the top is cut off and the leg (what makes it an R) shows.
+  { ch: 'R', size: 2600, left: colX(0), baseline: rowY(8) },
+  // T: centred on column line 4, sitting on row line 6, crossbar cut by the top.
+  { ch: 'T', size: 1500, centerX: colX(4), baseline: rowY(6) },
+  // G: right ink edge on column line 5, cap top on row line 1, cut left and bottom.
+  { ch: 'G', size: 2000, right: colX(5), capTop: rowY(1) },
+];
+function act3(t) {
+  fillBg(BLACK);
+  const t0 = 2 * BAR;
+  const b = Math.min(3, Math.floor((t - t0) / BEAT + 1e-9)); // which beat (0..3)
+  const tb = t0 + beatTime(b);
+  // Impact: the shape lands at full size on the cut and shivers like a spring.
+  const s = 1 + (hit(t, tb, 0.0001, 0.06) - 1);
+  if (b < 3) {
+    const L = ACT3[b];
+    ctx.save();
+    // scale around the grid point the letter is anchored to
+    const ax = L.left ?? L.right ?? L.centerX;
+    const ay = L.capTop ?? L.baseline;
+    ctx.translate(ax, ay); ctx.scale(s, s); ctx.translate(-ax, -ay);
+    ctx.fillStyle = WHITE;
+    drawGlyph(L.ch, L.size, L);
+    ctx.restore();
+  } else {
+    // The tiny red square: 24 px, top-left corner on a grid intersection.
+    const q = 24 * s;
+    ctx.fillStyle = RED;
+    ctx.fillRect(colX(4), rowY(5), q, q);
+  }
+}
+
+// ---------- ACT 4: RHYTHM (8.000 – 10.667) -------------------------------
+// White. RASTER / TRAME / GRIGLIA repeated as texture lines in two sizes,
+// flush left on column line 2, running off the right edge.
+// Beat 1: a thick red rule sweeps across. Beat 2: the small lines fill in.
+// Beat 3: the whole block rotates 90 degrees and locks to the grid.
+// Beat 4: the red rule drops to the bottom row.
+const BIG = 160, SMALL = 160 / 3;   // line pitches; 3 big + 9 small = 960 = 6 columns
+const ACT4_LINES = [];
+(function buildLines() {
+  const words = ['RASTER', 'TRAME', 'GRIGLIA'];
+  let y = 0;
+  for (let g = 0; g < 3; g++) {
+    ACT4_LINES.push({ big: true, top: y, text: (words[g] + ' ').repeat(6) });
+    y += BIG;
+    for (let k = 0; k < 3; k++) {
+      // small lines cycle through the three words, shifted each line (texture)
+      let s = '';
+      for (let n = 0; n < 24; n++) s += words[(n + g + k) % 3] + ' ';
+      ACT4_LINES.push({ big: false, top: y, text: s });
+      y += SMALL;
+    }
+  }
+})();
+// Block's top-left corner before rotation (column line 2, row line 1).
+const B4X = colX(2), B4Y = rowY(1);
+// Pivot chosen so that after a -90 degree turn the block spans exactly
+// x = 60..1020 (columns 0-6) and its first letters sit on row line 7.
+const P4X = (rowY(7) + B4X + colX(0) - B4Y) / 2;
+const P4Y = (rowY(7) + B4X - colX(0) + B4Y) / 2;
+
+function act4(t) {
+  fillBg(WHITE);
+  const t0 = 3 * BAR;
+  const b2 = t0 + beatTime(1), b3 = t0 + beatTime(2), b4 = t0 + beatTime(3);
+
+  // Text block, possibly rotating around the pivot.
+  const angle = -Math.PI / 2 * hit(t, b3, 0.16, 0.06);
+  const reveal = hitClamped(t, b2, 0.12);           // small lines wipe in for beat 2
+  ctx.save();
+  ctx.translate(P4X, P4Y); ctx.rotate(angle); ctx.translate(-P4X, -P4Y);
+  ctx.fillStyle = BLACK;
+  for (const L of ACT4_LINES) {
+    const pitch = L.big ? BIG : SMALL;
+    const size = (pitch * (L.big ? 0.75 : 0.6)) / CAP; // cap height = 75% / 60% of pitch
+    const baseline = B4Y + L.top + size * CAP;         // caps hang from the line's top
+    if (!L.big) {
+      if (reveal <= 0) continue;
+      ctx.save();
+      ctx.beginPath();
+      ctx.rect(B4X, B4Y + L.top, 2400 * reveal, pitch);
+      ctx.clip();
+    }
+    ctx.font = font(L.big ? 'bold' : 'normal', size);
+    ctx.fillText(L.text, B4X, baseline);
+    if (!L.big) ctx.restore();
+  }
+  ctx.restore();
+
+  // The thick red rule (40 px, Vignelli). Sweeps in from the left on beat 1,
+  // then drops from the top margin line to the bottom row on beat 4.
+  const sweep = easeOut(clamp01((t - t0) / 0.3));
+  const y = lerp(rowY(0), rowY(8) - 40, hit(t, b4, 0.14, 0.05));
+  ctx.fillStyle = RED;
+  ctx.fillRect(0, y, W * sweep, 40);
+}
+
+// ---------- ACT 5: SERIES (10.667 – 13.333) ------------------------------
+// A 4x4 square of 160 px modules on columns 1-5. On every half-beat the
+// six colours step one place along the diagonals (strict rotation:
+// colour index = (row + col + step) mod 6). Modules pinch just before
+// each half-beat and spring back as the colour changes.
+// Beat 3: the square turns 45 degrees. Beat 4: it snaps back.
+function act5(t) {
+  fillBg(BLACK);
+  const t0 = 4 * BAR, HALF = BEAT / 2;
+  const n = Math.min(7, Math.floor((t - t0) / HALF + 1e-9)); // half-beat step 0..7
+  const x0 = colX(1), y0 = rowY(2), S = 4 * COLW;            // the square
+  const cx = x0 + S / 2, cy = y0 + S / 2;
+
+  // Entry on beat 1 (cut + spring), rotation on beat 3, snap back on beat 4.
+  const enter = hit(t, t0, 0.0001, 0.15);
+  const ang = (Math.PI / 4) * (hit(t, t0 + beatTime(2), 0.16, 0.08)
+                             - hit(t, t0 + beatTime(3), 0.08, 0.08));
+
+  // Module pinch: in the last 0.1 s before each half-beat the modules
+  // squeeze in (anticipation); exactly on the half-beat the colours step
+  // and the modules slam back to full size, with a small spring overshoot.
+  const last = t0 + n * HALF, next = last + HALF;
+  const d = t - last;
+  const kick = n % 2 === 0 ? 0.06 : 0.03;           // beats kick harder than offbeats
+  let pinch = -kick * Math.exp(-10 * d) * Math.sin(22 * d); // negative = slightly bigger
+  const pre = next - t;
+  if (pre < 0.1 && n < 7) {
+    const depth = (n + 1) % 2 === 0 ? 0.22 : 0.12;  // squeeze deeper before a beat
+    pinch = depth * easeIn(1 - pre / 0.1);
+  }
+
+  ctx.save();
+  ctx.translate(cx, cy); ctx.rotate(ang); ctx.scale(enter, enter); ctx.translate(-cx, -cy);
+  for (let r = 0; r < 4; r++) {
+    for (let c = 0; c < 4; c++) {
+      ctx.fillStyle = SERIES[(r + c + n) % 6];
+      const m = COLW * (1 - pinch);
+      const mx = x0 + c * COLW + (COLW - m) / 2, my = y0 + r * COLW + (COLW - m) / 2;
+      ctx.fillRect(mx, my, m, m);
+    }
+  }
+  ctx.restore();
+}
+
+// ---------- ACT 6: LOCKUP (13.333 – 16.000) ------------------------------
+// Beat 1: RASTER + red rule. Beat 2: TRAME, GRIGLIA. Beat 3: red circle
+// and caption. A slow push-in over those three beats. Beat 4: everything
+// lifts away (ease-in exit) and lands on plain white = the first frame.
+function act6(t) {
+  fillBg(WHITE);
+  const t0 = 5 * BAR;
+  const b2 = t0 + beatTime(1), b3 = t0 + beatTime(2), b4 = t0 + beatTime(3);
+  if (t >= b4) return;                               // last beat: plain white
+
+  const push = 1 + 0.04 * clamp01((t - t0) / (3 * BEAT));
+  const exitP = easeIn(clamp01((t - (b4 - 0.2)) / 0.2)); // exit in the last 0.2 s
+  ctx.save();
+  ctx.translate(0, -1400 * exitP);
+  ctx.translate(W / 2, H / 2); ctx.scale(push, push); ctx.translate(-W / 2, -H / 2);
+
+  // RASTER, bold, ink exactly as wide as the 6 columns, sitting on row line 7.
+  const e1 = hit(t, t0, 0.0001, 0.06);
+  const ink = inkBox('RASTER', 'bold');
+  const size = (6 * COLW) / (ink.right - ink.left);
+  ctx.save();
+  ctx.translate(colX(0), rowY(7)); ctx.scale(e1, e1); ctx.translate(-colX(0), -rowY(7));
+  ctx.fillStyle = BLACK;
+  ctx.font = font('bold', size);
+  ctx.fillText('RASTER', colX(0) - ink.left * size, rowY(7));
+  ctx.restore();
+
+  // One red rule, 30 px, on row line 5, full grid width. Grows from the left.
+  ctx.fillStyle = RED;
+  ctx.fillRect(colX(0), rowY(5), 6 * COLW * Math.min(1, e1), 30);
+
+  // TRAME (bold) and GRIGLIA (regular), cap height 100 px, on row lines 2 and 3.
+  // They slide in from one column to the left and land on beat 2.
+  const e2 = hit(t, b2, 0.12, 0.08);
+  if (e2 > 0) {
+    const s2 = 100 / CAP;
+    const dx = (1 - e2) * -COLW;
+    ctx.fillStyle = BLACK;
+    ctx.font = font('bold', s2);
+    ctx.fillText('TRAME', colX(0) + dx, rowY(2));
+    ctx.font = font('normal', s2);
+    ctx.fillText('GRIGLIA', colX(0) + dx, rowY(3));
+  }
+
+  // Red circle: radius one column, centred on column line 5 / row line 2.
+  // Caption, small, flush left on the bottom margin line.
+  const e3 = hit(t, b3, 0.12, 0.1);
+  if (e3 > 0) {
+    ctx.fillStyle = RED;
+    ctx.beginPath();
+    ctx.arc(colX(5), rowY(2), COLW * e3, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = BLACK;
+    ctx.font = font('normal', 30);
+    ctx.fillText('90 BPM — 4/4 — 16 s', colX(0) + (1 - Math.min(1, e3)) * -40, rowY(8));
+  }
+  ctx.restore();
+}
+
+// ---------- 4. render(t): pick the act for this moment --------------------
+
+const ACTS = [act1, act2, act3, act4, act5, act6];
+let showOverlay = false;
+
+function render(t) {
+  t = ((t % LOOP) + LOOP) % LOOP;                    // wrap into 0..16
+  const a = Math.min(5, Math.floor(t / BAR + 1e-9)); // which act (0..5)
+  ACTS[a](t);
+  if (showOverlay) drawOverlay(t);
+}
+
+// D key: tiny bar.beat read-out in the top-left margin.
+function drawOverlay(t) {
+  const beat = Math.floor(t / BEAT + 1e-9);
+  const label = `${Math.floor(beat / 4) + 1}.${(beat % 4) + 1}`;
+  ctx.fillStyle = BLACK;
+  ctx.fillRect(0, 0, 120, 44);
+  ctx.fillStyle = WHITE;
+  ctx.font = font('bold', 24);
+  ctx.fillText(label, 14, 31);
+  ctx.font = font('normal', 16);
+  ctx.fillText(t.toFixed(2) + 's', 60, 30);
+}
+
+// ---------- 5. The clock: requestAnimationFrame + controls ----------------
+
+let clock = 0;          // playhead in seconds (unwrapped, keeps counting past 16)
+let paused = false;
+let lastNow = null;
+
+// window.seek(t): jump straight to any moment and draw it.
+window.seek = function (t) {
+  clock = t;
+  render(clock);
+  resyncMetronome();
+};
+
+function frame(now) {
+  if (lastNow !== null && !paused) clock += (now - lastNow) / 1000;
+  lastNow = now;
+  render(clock);
+  scheduleClicks();
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+window.addEventListener('keydown', e => {
+  if (e.code === 'Space') {
+    paused = !paused;
+    resyncMetronome();
+    e.preventDefault();
+  } else if (e.code === 'ArrowRight' || e.code === 'ArrowLeft') {
+    // Step to the next / previous beat exactly.
+    const b = clock / BEAT;
+    clock = (e.code === 'ArrowRight' ? Math.floor(b + 1e-6) + 1 : Math.ceil(b - 1e-6) - 1) * BEAT;
+    if (clock < 0) clock += LOOP;
+    render(clock);
+    resyncMetronome();
+    e.preventDefault();
+  } else if (e.code === 'KeyM') {
+    toggleMetronome();
+  } else if (e.code === 'KeyD') {
+    showOverlay = !showOverlay;
+  }
+});
+
+// ---------- 6. Metronome (Web Audio, synthesised clicks) ------------------
+// Clicks are scheduled a little ahead on the audio clock, matched to the
+// visual playhead, so the sound stays locked to t.
+
+let audio = null, metroOn = false, nextClick = 0;
+
+function toggleMetronome() {
+  if (!audio) audio = new (window.AudioContext || window.webkitAudioContext)();
+  audio.resume();
+  metroOn = !metroOn;
+  resyncMetronome();
+}
+function resyncMetronome() {
+  // the first beat at or after the current playhead
+  nextClick = Math.ceil(clock / BEAT - 1e-6);
+}
+function click(when, accent) {
+  const osc = audio.createOscillator(), gain = audio.createGain();
+  osc.frequency.value = accent ? 1760 : 1100;      // higher + louder on beat 1
+  gain.gain.setValueAtTime(accent ? 0.9 : 0.35, when);
+  gain.gain.exponentialRampToValueAtTime(0.001, when + 0.05);
+  osc.connect(gain).connect(audio.destination);
+  osc.start(when);
+  osc.stop(when + 0.06);
+}
+function scheduleClicks() {
+  if (!metroOn || paused || !audio) return;
+  while (nextClick * BEAT < clock + 0.15) {          // look 150 ms ahead
+    const when = audio.currentTime + (nextClick * BEAT - clock);
+    if (when >= audio.currentTime - 0.005) click(Math.max(when, audio.currentTime), nextClick % 4 === 0);
+    nextClick++;
+  }
+}
+</script>
+</body>
+</html>
