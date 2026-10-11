@@ -1,0 +1,291 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Swiss Grid in Motion</title>
+<style>
+  /* The page around the frame is ink-black, so the white frame stands out. */
+  html, body { margin: 0; height: 100%; background: #111111; overflow: hidden; }
+  /* The canvas is centred; its size is set by the script so it always fits. */
+  body { display: flex; align-items: center; justify-content: center; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<script>
+/* ==========================================================================
+   SWISS GRID IN MOTION
+   --------------------------------------------------------------------------
+   The big idea: nothing in this file "remembers" what happened before.
+   Every frame we call  seek(t)  with a time between 0 and 6 seconds, and
+   seek() redraws the whole picture from scratch using only that number.
+   That is what makes the loop seamless: t=6 gives exactly the same picture
+   as t=0, and you can jump to any moment (pause, step) and it still works.
+   ========================================================================== */
+
+// ---- The three colours we are allowed to use ------------------------------
+var GROUND = '#ffffff';   // paper
+var INK    = '#111111';   // type and lines
+var ACCENT = '#e30613';   // the red circle
+
+// ---- The frame and the 6-column grid (all numbers are pixels) -------------
+var W = 1080, H = 1350;          // the frame size
+var MARGIN = 72;                 // empty space around the grid
+var GUTTER = 24;                 // space between columns
+var COLS = 6;
+var COL_W = (W - 2 * MARGIN - (COLS - 1) * GUTTER) / COLS;   // 136
+function colLeft(i) { return MARGIN + i * (COL_W + GUTTER); } // left edge of column i (0-5)
+function colRight(i) { return colLeft(i) + COL_W; }
+
+var DURATION = 6;                // length of the loop in seconds
+var FONT = 'Helvetica, Arial, sans-serif';
+
+// ---- Small maths helpers ---------------------------------------------------
+// Keep a number between 0 and 1.
+function clamp01(x) { return x < 0 ? 0 : (x > 1 ? 1 : x); }
+// Progress 0..1 of time t inside the window [start, start+len].
+function prog(t, start, len) { return clamp01((t - start) / len); }
+// Eases: they turn a straight 0..1 ramp into a smoother one.
+function easeInOut(u) { return u < 0.5 ? 4*u*u*u : 1 - Math.pow(-2*u + 2, 3) / 2; }
+function easeOut(u)   { return 1 - Math.pow(1 - u, 3); }
+function easeIn(u)    { return u * u * u; }
+
+/* A damped spring. Give it the seconds since the thing "landed" and it
+   returns how far along it is: it starts at 0, overshoots 1 a little,
+   wobbles, and settles on 1. It is a formula of time, so no state is kept.
+     omega = how fast it wobbles, zeta = how quickly the wobble dies out.  */
+function spring(tau, omega, zeta) {
+  if (tau <= 0) return 0;
+  var decay = zeta * omega;
+  var wd = omega * Math.sqrt(1 - zeta * zeta);
+  return 1 - Math.exp(-decay * tau) * (Math.cos(wd * tau) + (decay / wd) * Math.sin(wd * tau));
+}
+
+/* Leaving the scene: after the start time, an element is pushed upward with
+   an ease-in (slow, then fast). It always finishes before t = 6.        */
+function exitOffset(t, delay) {
+  return easeIn(prog(t, 5.0 + delay, 0.7)) * 1800;
+}
+
+// ---- Set up the canvas -------------------------------------------------------
+var canvas = document.getElementById('stage');
+var ctx = canvas.getContext('2d');
+var lastT = 0;                    // the last time we drew (used when the window resizes)
+
+// Make the canvas as large as will fit in the window, keeping the 1080x1350 shape.
+function fitToWindow() {
+  var scale = Math.min(window.innerWidth / W, window.innerHeight / H);
+  var dpr = window.devicePixelRatio || 1;       // crisp on high-resolution screens
+  canvas.style.width  = (W * scale) + 'px';
+  canvas.style.height = (H * scale) + 'px';
+  canvas.width  = Math.round(W * scale * dpr);
+  canvas.height = Math.round(H * scale * dpr);
+  ctx.setTransform(canvas.width / W, 0, 0, canvas.height / H, 0, 0);  // draw in frame units
+  window.seek(lastT);
+}
+
+// ---- Words: measure them once so they fit the grid exactly -------------------
+/* Each word is sized so its ink spans a whole number of columns.
+   GRID  = all 6 columns, RHYTHM = all 6 columns, TIME = columns 1-4.       */
+var words = null;
+function makeWord(text, fromCol, toCol) {
+  var targetWidth = colRight(toCol) - colLeft(fromCol);
+  ctx.save();
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.font = 'bold 100px ' + FONT;
+  var m = ctx.measureText(text);
+  var inkWidth100 = m.actualBoundingBoxLeft + m.actualBoundingBoxRight;
+  var size = 100 * targetWidth / inkWidth100;           // font size that fills the columns
+  ctx.font = 'bold ' + size + 'px ' + FONT;
+  var m2 = ctx.measureText(text);
+  var letters = [];                                     // where each letter starts
+  for (var i = 0; i < text.length; i++) {
+    letters.push({ ch: text[i], dx: ctx.measureText(text.slice(0, i)).width });
+  }
+  ctx.restore();
+  return {
+    text: text, size: size, letters: letters,
+    // shift left by the glyph's own empty edge so the ink touches the column line (flush left)
+    x: colLeft(fromCol) + m2.actualBoundingBoxLeft,
+    cap: m2.actualAscent ? m2.actualAscent : size * 0.72   // height of the capital letters
+  };
+}
+function setupWords() {
+  words = {
+    grid:   makeWord('GRID',   0, 5),
+    rhythm: makeWord('RHYTHM', 0, 5),
+    time:   makeWord('TIME',   0, 3)
+  };
+  // Final resting baselines: stacked from the top margin with a fixed gap.
+  var GAP = 48;
+  words.grid.baseEnd   = MARGIN + words.grid.cap;
+  words.rhythm.baseEnd = words.grid.baseEnd + GAP + words.rhythm.cap;
+  words.time.baseEnd   = words.rhythm.baseEnd + GAP + words.time.cap;
+  words.grid.baseStart = 760;                           // where GRID first lands
+}
+
+// Draw a word letter by letter. dropOf(i) gives the vertical shift of letter i.
+function drawWord(w, baseline, alpha, dropOf) {
+  if (alpha <= 0) return;
+  ctx.globalAlpha = alpha;
+  ctx.fillStyle = INK;
+  ctx.font = 'bold ' + w.size + 'px ' + FONT;
+  ctx.textBaseline = 'alphabetic';
+  ctx.textAlign = 'left';
+  for (var i = 0; i < w.letters.length; i++) {
+    ctx.fillText(w.letters[i].ch, w.x + w.letters[i].dx, baseline + (dropOf ? dropOf(i) : 0));
+  }
+  ctx.globalAlpha = 1;
+}
+
+/* ==========================================================================
+   seek(t): draw the picture for time t (seconds). This is the only drawing
+   function. Everything below is a pure function of t.
+   ========================================================================== */
+window.seek = function (t) {
+  t = ((t % DURATION) + DURATION) % DURATION;   // wrap into 0..6
+  lastT = t;
+  if (!words) setupWords();
+
+  // --- Blank paper ---------------------------------------------------------
+  ctx.globalAlpha = 1;
+  ctx.fillStyle = GROUND;
+  ctx.fillRect(0, 0, W, H);
+
+  // --- Beat 4 (3.8-5.0): the whole layout snaps to 45 degrees and back ----
+  // Snap in with a springy overshoot, hold, then ease back to 0 by t = 5.0.
+  var snapAngle = 45 * spring(t - 3.8, 20, 0.55);
+  var angle = snapAngle;
+  if (t >= 4.5) {
+    var held = 45 * spring(4.5 - 3.8, 20, 0.55);          // angle at the moment we turn back
+    angle = held * (1 - easeInOut(prog(t, 4.5, 0.5)));
+  }
+  ctx.save();
+  ctx.translate(W / 2, H / 2);                            // spin around the frame's centre
+  ctx.rotate(angle * Math.PI / 180);
+  ctx.translate(-W / 2, -H / 2);
+
+  // --- Beat 1 (0.0-0.4) + exit: faint column lines draw down from the top --
+  // Each column has a left line and a right line. They are drawn longer than
+  // the frame so they still fill the picture when it is rotated.
+  var lineAlpha = 1 - prog(t, 5.0, 1.0);                  // fade out during the exit
+  if (lineAlpha > 0) {
+    ctx.strokeStyle = INK;
+    ctx.lineWidth = 2;
+    ctx.globalAlpha = 0.13 * lineAlpha;
+    var k = 0;
+    for (var c = 0; c < COLS; c++) {
+      var xs = [colLeft(c), colRight(c)];
+      for (var s = 0; s < 2; s++, k++) {
+        var p = easeOut(prog(t, 0.01 * k, 0.28));         // small stagger between lines
+        var yEnd = p * 2250;                              // grows downward from y=0
+        ctx.beginPath();
+        ctx.moveTo(xs[s], -900);
+        ctx.lineTo(xs[s], -900 + yEnd + 900);             // at p=0 it ends at y=0: unseen
+        ctx.stroke();
+      }
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  // --- The GRID word's journey ------------------------------------------------
+  var g = words.grid;
+  // Beat 3 (2.6-3.8): GRID slides up from its first baseline to the top.
+  var slide = easeInOut(prog(t, 2.6, 0.8));
+  var gridBase = g.baseStart + (g.baseEnd - g.baseStart) * slide - exitOffset(t, 0);
+  // Beat 2 (0.4-1.6): letters drop in one after another and land with a spring.
+  drawWord(g, gridBase, 1, function (i) {
+    var start = 0.4 + 0.12 * i;
+    return -800 * (1 - spring(t - start, 18, 0.7));
+  });
+
+  // --- Beat 3: RHYTHM and TIME rise into place, one after the other ----------
+  var r = words.rhythm, m = words.time;
+  var rStart = 2.8, mStart = 3.0;
+  drawWord(r, r.baseEnd + 500 * (1 - spring(t - rStart, 16, 0.7)) - exitOffset(t, 0.08),
+           prog(t, rStart, 0.15), null);
+  drawWord(m, m.baseEnd + 500 * (1 - spring(t - mStart, 16, 0.7)) - exitOffset(t, 0.16),
+           prog(t, mStart, 0.15), null);
+
+  // --- Beat 2 (1.6-2.6): the red circle rolls along the baseline ------------
+  var R = 56;                                              // circle radius
+  var ruleStart = 880, ruleEnd = m.baseEnd;                // the baseline rule, before/after the slide
+  var ruleY = ruleStart + (ruleEnd - ruleStart) * slide - exitOffset(t, 0.24);
+  var ruleAlpha = prog(t, 1.4, 0.2) * (1 - prog(t, 5.0, 1.0));
+  if (ruleAlpha > 0) {
+    ctx.globalAlpha = ruleAlpha;
+    ctx.fillStyle = INK;
+    ctx.fillRect(MARGIN, ruleY - 1.5, W - 2 * MARGIN, 3);  // a thin ink baseline
+    ctx.globalAlpha = 1;
+  }
+  var stopX = colLeft(4) + COL_W / 2;                      // centre of column 5
+  var startX = -R - 20;                                    // just off the left edge
+  var cx = startX + (stopX - startX) * easeOut(prog(t, 1.6, 1.0));
+  var cy = ruleY - R;                                      // sitting on the rule
+  var roll = (cx - startX) / R;                            // rolling: turn by distance / radius
+  ctx.fillStyle = ACCENT;
+  ctx.beginPath();
+  ctx.arc(cx, cy, R, 0, Math.PI * 2);
+  ctx.fill();
+  // A small white dot near the rim, so you can see the circle actually turning.
+  ctx.fillStyle = GROUND;
+  ctx.beginPath();
+  ctx.arc(cx + Math.cos(roll) * R * 0.62, cy + Math.sin(roll) * R * 0.62, R * 0.14, 0, Math.PI * 2);
+  ctx.fill();
+
+  // --- Small captions on the bottom row, flush left on the grid -----------------
+  var capAlpha = prog(t, 3.4, 0.4) * (1 - prog(t, 5.0, 0.6));
+  if (capAlpha > 0) {
+    var capY = 1278 - exitOffset(t, 0.24);
+    ctx.globalAlpha = capAlpha;
+    ctx.fillStyle = INK;
+    ctx.font = '24px ' + FONT;
+    ctx.textBaseline = 'alphabetic';
+    ctx.textAlign = 'left';
+    ctx.fillText('Swiss Grid in Motion', colLeft(0), capY);
+    ctx.fillText('Müller-Brockmann, Ruder, Gerstner', colLeft(3), capY);
+    ctx.globalAlpha = 1;
+  }
+
+  ctx.restore();
+};
+
+/* ==========================================================================
+   The clock: requestAnimationFrame calls tick() before every screen refresh.
+   We turn wall-clock time into t, then hand it to seek().
+   ========================================================================== */
+var clock = 0;            // current time inside the loop, in seconds
+var paused = false;
+var wallStart = performance.now();   // wall-clock moment that corresponds to clock = 0
+
+function tick(now) {
+  if (!paused) {
+    clock = (((now - wallStart) / 1000) % DURATION + DURATION) % DURATION;  // elapsed seconds mod 6
+    window.seek(clock);
+  }
+  requestAnimationFrame(tick);
+}
+
+// Space pauses/resumes. Left/right arrows step by 1/30 second (and pause).
+window.addEventListener('keydown', function (e) {
+  if (e.code === 'Space') {
+    e.preventDefault();
+    paused = !paused;
+    // On resume, move the start marker so the clock carries on from where it stopped.
+    if (!paused) wallStart = performance.now() - clock * 1000;
+  } else if (e.code === 'ArrowRight' || e.code === 'ArrowLeft') {
+    e.preventDefault();
+    paused = true;
+    clock = (clock + (e.code === 'ArrowRight' ? 1 : -1) / 30 + DURATION) % DURATION;
+    window.seek(clock);
+  }
+});
+
+window.addEventListener('resize', fitToWindow);
+fitToWindow();
+requestAnimationFrame(tick);
+</script>
+</body>
+</html>
