@@ -1,0 +1,567 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Swiss Grid in Motion</title>
+  <style>
+    /* Make the page fill the window, with a white background. */
+    html, body { margin: 0; height: 100%; background: #ffffff; overflow: hidden; }
+    /* Put the canvas in the middle of the window. */
+    body { display: flex; align-items: center; justify-content: center; }
+    canvas { display: block; }
+  </style>
+</head>
+<body>
+<!-- The one canvas. Everything in the animation is drawn onto it. -->
+<canvas id="stage"></canvas>
+
+<script>
+// ---------------------------------------------------------------
+// PART 1 (first half): the shared toolbox "SG", the column lines,
+// and the drawing code (render). Nothing here moves by itself;
+// it only draws whatever time t we give it.
+// ---------------------------------------------------------------
+(function () {
+  // Find the canvas that is already on the page.
+  const canvas = document.getElementById('stage');
+  const ctx = canvas.getContext('2d');
+
+  // SG is the shared toolbox. The other parts read these values and
+  // helper functions. We also keep a list of "layers" (things to draw).
+  const SG = window.SG = {
+    // Size of the design frame, in design units (pixels of the design).
+    W: 1080,
+    H: 1350,
+    // Length of one loop in seconds. At t = 6 we are back at t = 0.
+    LOOP: 6,
+
+    // Colors. Only these three are used in the whole piece.
+    GROUND: '#ffffff',   // white background
+    INK: '#111111',      // near-black text and lines
+    ACCENT: '#e30613',   // the red circle
+
+    // Font used for all the big words.
+    FONT_FAMILY: 'Helvetica, Arial, sans-serif',
+
+    // Grid numbers: outside margin, space between columns, width of a column.
+    MARGIN: 90,
+    GUTTER: 24,
+    COL_W: 130,
+
+    // Left edge of column number i (i = 1 to 6).
+    // Column 1 starts at 90, column 2 at 244, and so on.
+    colX(i) {
+      return SG.MARGIN + (i - 1) * (SG.COL_W + SG.GUTTER);
+    },
+
+    // Keep a number x between a and b. If x is too small, give a;
+    // if it is too big, give b.
+    clamp(x, a, b) {
+      return Math.min(Math.max(x, a), b);
+    },
+
+    // Blend between a and b. u = 0 gives a, u = 1 gives b.
+    lerp(a, b, u) {
+      return a + (b - a) * u;
+    },
+
+    // Easing curves. Each takes a number u from 0 to 1 (clamped) and
+    // gives back a number from 0 to 1 that changes speed over time.
+
+    // Starts fast, then slows down near the end.
+    easeOutCubic(u) {
+      u = SG.clamp(u, 0, 1);
+      return 1 - Math.pow(1 - u, 3);
+    },
+
+    // Starts slow, then speeds up.
+    easeInCubic(u) {
+      u = SG.clamp(u, 0, 1);
+      return u * u * u;
+    },
+
+    // Starts slow, then speeds up a little less steeply than cubic.
+    easeInQuad(u) {
+      u = SG.clamp(u, 0, 1);
+      return u * u;
+    },
+
+    // A damped spring. tau is seconds since the spring was let go.
+    // Result goes from 1 down to 0, bouncing a little past 0 on the
+    // way (overshoot), then settles. It starts with no speed.
+    springDecay(tau, omega, zeta) {
+      if (tau <= 0) return 1;          // before it starts, it is still at 1
+      const wd = omega * Math.sqrt(1 - zeta * zeta);   // wobble speed
+      return Math.exp(-zeta * omega * tau) *
+             (Math.cos(wd * tau) + (zeta * omega / wd) * Math.sin(wd * tau));
+    },
+
+    // A spring that moves a value from "from" to "to".
+    // Before time "start" the value is just "from".
+    spring(t, start, from, to, omega, zeta) {
+      if (t < start) return from;
+      return to + (from - to) * SG.springDecay(t - start, omega, zeta);
+    },
+
+    // An exit move: the value stays at 0 until "start", then slides
+    // by "dist" over "dur" seconds (speeding up), and stays at "dist".
+    exit(t, start, dur, dist) {
+      if (t < start) return 0;
+      return dist * SG.easeInCubic((t - start) / dur);
+    },
+
+    // The list of layers. Each part adds one object like
+    // { name, z, draw(ctx, t) }. Lower z is drawn first (further back).
+    layers: [],
+
+    // These two are filled in below (render) and in the clock script.
+    render: null,
+    isPaused: null,
+  };
+
+  // Work out the scale: how big the 1080 x 1350 frame must be on screen
+  // so it fits in the window. Also set the canvas size so it looks sharp
+  // on high-density screens. Returns the factor we use for drawing (s * dpr).
+  function fitCanvas() {
+    const s = Math.min(window.innerWidth / SG.W, window.innerHeight / SG.H);
+    const dpr = window.devicePixelRatio || 1;
+
+    // The size the canvas takes up on the page (in normal pixels).
+    canvas.style.width = (SG.W * s) + 'px';
+    canvas.style.height = (SG.H * s) + 'px';
+
+    // The real number of pixels inside the canvas (sharper when dpr is big).
+    // Only change it when needed, because changing it clears the canvas.
+    const bw = Math.round(SG.W * s * dpr);
+    const bh = Math.round(SG.H * s * dpr);
+    if (canvas.width !== bw) canvas.width = bw;
+    if (canvas.height !== bh) canvas.height = bh;
+
+    return s * dpr;
+  }
+
+  // The global rotation at time t, in degrees (positive = clockwise).
+  // Beat 5: the whole layout snaps to 45 degrees, then springs back.
+
+  // Rotation while it is snapping to 45 degrees (times 3.8 to 4.4).
+  function thetaSnap(t) {
+    return 45 * (1 - SG.springDecay(t - 3.8, 20, 0.55));
+  }
+
+  function rotationAt(t) {
+    if (t < 3.8) return 0;                      // not yet
+    if (t < 4.4) return thetaSnap(t);           // snapping to 45 degrees
+    // After 4.4 we spring back to 0, starting from wherever the snap ended.
+    return thetaSnap(4.4) * SG.springDecay(t - 4.4, 20, 0.55);
+  }
+
+  // The column lines (beat 1 draws them, beat 6 fades them out).
+  // They are at z = 0, so they are drawn first, behind everything else.
+  SG.layers.push({
+    name: 'column-lines',
+    z: 0,
+    draw(ctx, t) {
+      ctx.save();
+      ctx.strokeStyle = SG.INK;
+      ctx.lineWidth = 2;
+
+      // Fade factor for beat 6: 1 until 5.2 s, then fades to 0 by 5.9 s.
+      const fade = 1 - SG.easeInQuad((t - 5.2) / 0.7);
+
+      // There are 12 lines: a left and a right edge for each of the 6 columns.
+      // j = 0 is the first (leftmost) line, j = 11 is the last.
+      for (let j = 0; j < 12; j++) {
+        const col = Math.floor(j / 2) + 1;               // which column, 1 to 6
+        const left = SG.colX(col);
+        const x = (j % 2 === 0) ? left : left + SG.COL_W; // left or right edge
+
+        // How far this line has been drawn, from 0 to 1.
+        // Each line starts 0.01 s later than the one before it.
+        const p = SG.easeOutCubic((t - 0.01 * j) / 0.28);
+
+        if (p <= 0 || fade <= 0) continue;  // nothing to draw yet (or gone)
+
+        ctx.globalAlpha = 0.14 * fade;      // faint, and fading in beat 6
+        ctx.beginPath();
+        ctx.moveTo(x, -300);                // start above the frame
+        ctx.lineTo(x, -300 + 1950 * p);     // grow downward
+        ctx.stroke();
+      }
+
+      ctx.restore();
+    },
+  });
+
+  // Draw the whole picture for time t.
+  // Nothing is remembered between calls: we clear and draw everything again.
+  function render(t) {
+    const k = fitCanvas();   // size the canvas and get the scale
+
+    // Step 1: use plain pixel coordinates and paint the whole canvas white.
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = SG.GROUND;
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+    // Step 2: switch to design units (1080 x 1350), scaled to fit the window.
+    ctx.setTransform(k, 0, 0, k, 0, 0);
+
+    // Step 3: turn the whole layout around the center of the frame (540, 675).
+    // Moving the origin to the center, turning, then moving it back.
+    ctx.translate(540, 675);
+    ctx.rotate(rotationAt(t) * Math.PI / 180);   // degrees to radians
+    ctx.translate(-540, -675);
+
+    // Step 4: draw every layer, lowest z first.
+    // slice() makes a copy, so sorting does not change the original list.
+    const ordered = SG.layers.slice().sort((a, b) => a.z - b.z);
+    for (const layer of ordered) {
+      layer.draw(ctx, t);
+    }
+  }
+
+  // Expose render to the rest of the page and to testing.
+  SG.render = render;
+})();
+</script>
+
+<script>
+// GRID layer (z 10): the big word "GRID".
+// Beat 2 (0.4 - 1.6 s): the letters drop in one at a time from above.
+// Beat 4 (2.6 - 3.8 s): the whole word slides up to its final place.
+// Beat 6 (5.0 - 6.0 s): the whole word exits upward.
+// Everything here is a pure function of t: no state is kept between frames.
+
+(function () {
+  // The word, its font size, and the letter spacing ("tracking").
+  var WORD = "GRID";
+  var SIZE = 340;
+  var TRACK = -0.02 * SIZE; // a little tighter than normal, scaled to the size
+
+  // Where the word starts on the left (the left margin of the grid).
+  var LEFT_X = 90;
+
+  // Letter k (0 = G, 1 = R, 2 = I, 3 = D) starts dropping at this time.
+  var DROP_FIRST = 0.40;
+  var DROP_STEP = 0.18; // each next letter starts 0.18 s later
+
+  // Baseline (the line the letters sit on) for the moving word.
+  // The word lands at 760 while it drops, then slides up to 460.
+  var BASE_LANDED = 760;
+  var BASE_FINAL = 460;
+  var SLIDE_START = 2.6;
+
+  // Exit: the word leaves upward starting at 5.0 s.
+  var EXIT_START = 5.0;
+  var EXIT_DUR = 0.55;
+  var EXIT_DIST = -1500;
+
+  // Work out the x position of letter k.
+  // The rule is: x = left margin + width of all letters before k + k * tracking.
+  // We measure the text before letter k, so the spacing is always exact.
+  function letterX(ctx, k) {
+    var before = WORD.slice(0, k); // the letters that come before letter k
+    var measured = ctx.measureText(before).width;
+    // Side bearing: every letter has a little empty space on its left before
+    // the ink starts. actualBoundingBoxLeft is negative when the ink starts to
+    // the right of the drawing point, so adding it pulls the word left until
+    // the INK (not the empty space) sits exactly on the margin.
+    var bearing = ctx.measureText(WORD.charAt(0)).actualBoundingBoxLeft;
+    return LEFT_X + bearing + measured + k * TRACK;
+  }
+
+  function draw(ctx, t) {
+    // Save the canvas settings so nothing leaks into other layers.
+    ctx.save();
+
+    // Set the font and the text settings used for every letter.
+    ctx.font = "bold " + SIZE + "px " + SG.FONT_FAMILY;
+    ctx.textBaseline = "alphabetic";
+    ctx.textAlign = "left";
+    ctx.fillStyle = SG.INK;
+    ctx.globalAlpha = 1;
+
+    // How far the whole word has moved up or down right now.
+    // The spring slides it from 760 to 460 after 2.6 s.
+    var baseline = SG.spring(t, SLIDE_START, BASE_LANDED, BASE_FINAL, 12, 0.6);
+
+    // The exit moves the whole word up after 5.0 s (0 before that).
+    var exitOffset = SG.exit(t, EXIT_START, EXIT_DUR, EXIT_DIST);
+
+    // Draw each letter one by one.
+    for (var k = 0; k < WORD.length; k++) {
+      // When this letter starts to drop.
+      var startK = DROP_FIRST + DROP_STEP * k;
+
+      // Do not draw this letter yet.
+      if (t < startK) {
+        continue;
+      }
+
+      // How far this letter is still above its place (-1000 at the start, 0 when landed).
+      var dropOffset = SG.spring(t, startK, -1000, 0, 16, 0.5);
+
+      // Where this letter sits horizontally.
+      var x = letterX(ctx, k);
+
+      // Final height = slide position + drop offset + exit offset.
+      var y = baseline + dropOffset + exitOffset;
+
+      ctx.fillText(WORD.charAt(k), x, y);
+    }
+
+    // Put the canvas settings back the way they were.
+    ctx.restore();
+  }
+
+  // Register this layer. z = 10 means it is drawn above the column lines.
+  SG.layers.push({ name: "grid", z: 10, draw: draw });
+})();
+</script>
+<script>
+// Part 3: the red circle layer.
+// This file is one piece of the animation. It adds the red circle with a
+// white rolling dot on it. The circle rolls in from the left during beat 3
+// and slides up and out during beat 6.
+
+(function () {
+  // Radius of the red circle. Its diameter is one column wide (130 units).
+  var RADIUS = 65;
+
+  // Radius of the small white marker dot.
+  var DOT_RADIUS = 11;
+
+  // How far the dot sits from the middle of the circle.
+  var DOT_DISTANCE = 38;
+
+  // The height of the circle's center when it rests on the baseline (y = 1170).
+  // The center is 65 above the baseline, which is the circle's radius.
+  var CENTER_Y = 1105;
+
+  // Where the circle starts its roll: 80 units left of the frame, so it is
+  // off screen at the start. Its center is then 771 at the end of the roll.
+  var START_X = -80;
+  var END_X = 771; // the center of column 5
+
+  // Colors used by the circle and the dot.
+  var RED = "#e30613";
+  var WHITE = "#ffffff";
+
+  // This function draws the circle and its dot for a given time t (seconds).
+  // It only depends on t, so the same t always gives the same picture.
+  function draw(ctx, t) {
+    // Work out where the circle's center is across the page.
+    // Before t = 1.6 it sits at -80 (off screen). Then a bouncy spring
+    // carries it to 771, overshooting a little and settling.
+    var cx = SG.spring(t, 1.6, START_X, END_X, 9, 0.55);
+
+    // Work out how far the circle has moved up or down during the exit.
+    // Before t = 5.24 this is 0. After that it slides up by 1500 units.
+    var exitOffset = SG.exit(t, 5.24, 0.55, -1500);
+
+    // The circle's vertical center, with the exit movement added.
+    var cy = CENTER_Y + exitOffset;
+
+    // The dot's angle around the circle. It starts pointing straight up
+    // (-PI/2). Each 65 units the circle rolls to the right turns the dot
+    // by one radian, just like a wheel rolling along the ground.
+    var angle = -Math.PI / 2 + (cx - START_X) / RADIUS;
+
+    // Where the dot's center sits, on a small circle inside the red one.
+    var dotX = cx + DOT_DISTANCE * Math.cos(angle);
+    var dotY = cy + DOT_DISTANCE * Math.sin(angle);
+
+    // Save the canvas settings so that we can put them back afterward.
+    // This keeps this layer from changing anything the other layers use.
+    ctx.save();
+
+    // Draw the big red circle.
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = RED;
+    ctx.beginPath();
+    ctx.arc(cx, cy, RADIUS, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Draw the small white dot on top of the red circle.
+    ctx.fillStyle = WHITE;
+    ctx.beginPath();
+    ctx.arc(dotX, dotY, DOT_RADIUS, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Put the canvas settings back the way they were before this layer.
+    ctx.restore();
+  }
+
+  // Add this layer to the list of layers. z = 20 means it is drawn above
+  // the lower layers (the lines and the grid text).
+  SG.layers.push({ name: "circle", z: 20, draw: draw });
+})();
+</script>
+<script>
+// Part 4: the RHYTHM and TIME words (layer z 10).
+// RHYTHM and TIME stack in from below with a springy landing (beat 4),
+// then both fly up and out of the frame in a staggered way (beat 6).
+// This file is plain JavaScript that runs inside the page. It is wrapped in
+// a function so its variables stay private and do not clash with other parts.
+(function () {
+
+  // The two words this layer draws. Each one has:
+  //   text      - the letters to draw
+  //   size      - font size in design units (pixels of the 1080 x 1350 frame)
+  //   base      - the baseline y where the word finally rests (beat 4-5)
+  //   start     - when the stack-in spring begins (the word is hidden before this)
+  //   exitStart - when the word begins to fly up and out (beat 6)
+  var WORDS = [
+    { text: "RHYTHM", size: 190, base: 680, start: 2.80, exitStart: 5.08 },
+    { text: "TIME",   size: 190, base: 860, start: 3.00, exitStart: 5.16 }
+  ];
+
+  // Draw one word at time t, letter by letter.
+  function drawWord(ctx, t, w) {
+    // Before its turn to stack in, the word is not drawn at all.
+    if (t < w.start) {
+      return;
+    }
+
+    var size = w.size;
+    // Tracking: letters sit a little closer together (2% of the font size).
+    var track = -0.02 * size;
+
+    // Set the font first, because measureText uses the current font.
+    ctx.font = "bold " + size + "px " + SG.FONT_FAMILY;
+
+    // How far the word is still below its resting place.
+    // It starts 700 units low and springs up to 0 with a little bounce.
+    var rise = SG.spring(t, w.start, 700, 0, 13, 0.6);
+
+    // How far the word has moved up during the exit (0 until exitStart,
+    // then it accelerates upward and stays off the top of the frame).
+    var exitMove = SG.exit(t, w.exitStart, 0.55, -1500);
+
+    // The final baseline height for this word at time t.
+    var y = w.base + rise + exitMove;
+
+    // Draw each letter at its own x position.
+    // The x of letter k is: left margin + width of all letters before it + k * track.
+    // Side bearing: each letter has a little empty space on its left before the
+    // ink starts. actualBoundingBoxLeft is negative when the ink starts right of
+    // the drawing point, so adding it makes the first letter's ink touch the margin.
+    var bearing = ctx.measureText(w.text.charAt(0)).actualBoundingBoxLeft;
+    for (var k = 0; k < w.text.length; k++) {
+      var before = w.text.slice(0, k);            // the letters before this one
+      var x = SG.MARGIN + bearing + ctx.measureText(before).width + k * track;
+      ctx.fillText(w.text.charAt(k), x, y);
+    }
+  }
+
+  // The layer's draw function. The canvas already uses design units and
+  // is already rotated (beat 5). We only depend on the time t.
+  function draw(ctx, t) {
+    // Save the canvas state, so our settings do not leak into other layers.
+    ctx.save();
+
+    ctx.fillStyle = SG.INK;        // the ink colour, #111111
+    ctx.textAlign = "left";        // flush left, like the rest of the grid
+    ctx.textBaseline = "alphabetic";
+    ctx.globalAlpha = 1;           // full strength, no see-through
+
+    for (var i = 0; i < WORDS.length; i++) {
+      drawWord(ctx, t, WORDS[i]);
+    }
+
+    // Put the canvas state back the way it was.
+    ctx.restore();
+  }
+
+  // Register this layer so the page draws it at z 10.
+  SG.layers.push({ name: "words", z: 10, draw: draw });
+
+})();
+</script>
+
+<script>
+// ---------------------------------------------------------------
+// PART 1 (second half): the clock. It decides what time t it is,
+// and it handles pause, seek and the arrow keys. Then it starts
+// drawing.
+// ---------------------------------------------------------------
+(function () {
+  const SG = window.SG;
+
+  // The current time in the loop (0 to 6 seconds).
+  let currentT = 0;
+  // True while the animation is playing on its own.
+  let playing = true;
+  // The most recent frame time from requestAnimationFrame, in seconds.
+  let lastSec = 0;
+  // Used to work out time while playing: t = (frame time - offset) mod 6.
+  // It is reset every time we pause, seek or step, so playback
+  // continues from the right place.
+  let offset = 0;
+
+  // Wrap any time into the range 0 up to (but not including) 6.
+  function wrap(t) {
+    return ((t % SG.LOOP) + SG.LOOP) % SG.LOOP;
+  }
+
+  // Jump to time t and draw that moment right away.
+  // If the animation is playing, it keeps playing from t.
+  function seek(t) {
+    currentT = wrap(t);
+    offset = lastSec - currentT;   // remember where we are for the next frame
+    SG.render(currentT);
+  }
+  window.seek = seek;
+
+  // Let the testing code ask whether we are paused.
+  SG.isPaused = function () {
+    return !playing;
+  };
+
+  // Called by the browser about 60 times a second, when it is ready to draw.
+  function frame(ms) {
+    lastSec = ms / 1000;
+    if (playing) {
+      currentT = wrap(lastSec - offset);
+      SG.render(currentT);
+    }
+    requestAnimationFrame(frame);
+  }
+
+  // Keyboard controls.
+  window.addEventListener('keydown', function (e) {
+    if (e.code === 'Space') {
+      // Space: pause or play.
+      e.preventDefault();
+      if (playing) {
+        playing = false;
+      } else {
+        playing = true;
+        offset = lastSec - currentT;   // keep playing from the same moment
+      }
+    } else if (e.code === 'ArrowRight') {
+      // Right arrow: pause, then move forward one frame (1/30 second).
+      e.preventDefault();
+      playing = false;
+      seek(currentT + 1 / 30);
+    } else if (e.code === 'ArrowLeft') {
+      // Left arrow: pause, then move back one frame (1/30 second).
+      e.preventDefault();
+      playing = false;
+      seek(currentT - 1 / 30);
+    }
+  });
+
+  // When the window changes size, draw the current moment again at the new size.
+  window.addEventListener('resize', function () {
+    SG.render(currentT);
+  });
+
+  // Start: draw the first picture, then start the frame loop.
+  SG.render(currentT);
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
