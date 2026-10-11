@@ -1,0 +1,405 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Swiss Hero Spot</title>
+<style>
+  /* The page is pure black; the canvas sits in the middle, scaled to fit. */
+  html, body { margin: 0; height: 100%; background: #000000; overflow: hidden; }
+  body { display: flex; align-items: center; justify-content: center; }
+  canvas { display: block; background: #ffffff; }
+  /* Small bar.beat readout, toggled with the D key. */
+  #overlay {
+    position: fixed; top: 8px; left: 8px; padding: 4px 8px;
+    font: bold 14px "Helvetica Neue", Helvetica, Arial, sans-serif;
+    color: #ffffff; background: #e30613; display: none;
+  }
+</style>
+</head>
+<body>
+<canvas id="c" width="1080" height="1350"></canvas>
+<div id="overlay">1.1</div>
+<script>
+// =====================================================================
+// SWISS HERO SPOT — a 16 second loop, drawn on a <canvas>.
+// The golden rule: everything you see is a pure function of time t.
+// window.seek(t) paints the frame for time t; nothing remembers the past.
+// =====================================================================
+
+// ---------- Canvas and fixed picture size ----------
+const W = 1080, H = 1350;
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+
+// Scale the 1080x1350 canvas so it fits the window (CSS only, keeps it cheap on phones).
+function fit() {
+  const s = Math.min(window.innerWidth / W, window.innerHeight / H);
+  canvas.style.width = (W * s) + 'px';
+  canvas.style.height = (H * s) + 'px';
+}
+window.addEventListener('resize', fit);
+fit();
+
+// ---------- Colours ----------
+const WHITE = '#ffffff', BLACK = '#111111', RED = '#e30613';
+// Act 5 serial sequence, in this exact order.
+const SERIES = ['#e30613', '#ff6a00', '#ffd200', '#00a651', '#0057b8', '#5b2c86'];
+const FONT = '"Helvetica Neue", Helvetica, Arial, sans-serif';
+
+// ---------- The grid: 6 columns x 8 rows inside 60 px margins ----------
+const MARGIN = 60;
+const COL = (W - 2 * MARGIN) / 6;   // 160 px wide columns
+const ROW = (H - 2 * MARGIN) / 8;   // 153.75 px tall rows
+const gx = c => MARGIN + c * COL;   // x of vertical grid line number c (0..6)
+const gy = r => MARGIN + r * ROW;   // y of horizontal grid line number r (0..8)
+
+// ---------- Musical time ----------
+const LOOP = 16;
+const BEAT = 2 / 3;          // 90 BPM
+const BAR = 4 * BEAT;        // 8/3 s, one act per bar
+const LEAD = 0.09;           // moves begin this many seconds before the beat
+
+// ---------- Small maths helpers ----------
+const clamp01 = x => Math.max(0, Math.min(1, x));
+const lerp = (a, b, k) => a + (b - a) * k;
+const easeIn = x => x * x * x;                      // slow start, fast end (for exits)
+const easeOut = x => 1 - Math.pow(1 - x, 3);        // fast start, gentle end
+const easeInOut = x => x < 0.5 ? 4 * x * x * x : 1 - Math.pow(-2 * x + 2, 3) / 2;
+
+// land(): a move that STARTS slightly before beat time tb and LANDS on it,
+// then settles with a damped spring (a little overshoot that dies away).
+// Returns 0 before the move and exactly 1 AT the beat; after that it overshoots
+// a little and wobbles back to 1. amp = how big the overshoot is.
+function land(t, tb, amp = 0.2) {
+  if (t < tb - LEAD) return 0;
+  if (t < tb) return easeIn((t - (tb - LEAD)) / LEAD);  // the run-up, reaches 1 on the beat
+  const u = t - tb;                                     // time since impact
+  return 1 + amp * Math.exp(-9 * u) * Math.sin(24 * u); // the damped spring
+}
+
+// hit(): for things that appear by a HARD CUT on the beat (act starts, where a
+// move cannot begin before the act exists). At the beat they are already 60%
+// of the way there, then spring the rest of the way with a little overshoot.
+function hit(t, tb) {
+  if (t < tb) return 0;
+  const u = t - tb;
+  return 1 - 0.4 * Math.exp(-11 * u) * Math.cos(20 * u);
+}
+
+// Text helper: draw a word with its LEFT INK EDGE exactly at x (fonts have side bearings).
+function textAt(str, x, y, size, bold, color) {
+  ctx.font = (bold ? 'bold ' : '') + size + 'px ' + FONT;
+  ctx.fillStyle = color;
+  const m = ctx.measureText(str);
+  ctx.fillText(str, x + (m.actualBoundingBoxLeft || 0), y);
+  return m.width;
+}
+
+function fillBg(color) { ctx.fillStyle = color; ctx.fillRect(0, 0, W, H); }
+
+// =====================================================================
+// ACT 1 — GRID (0 to 2.667 s)
+// Beat 1: grid lines draw in fast. Beats 2-4: black modules fill cells.
+// The rule (Gerstner-style permutation): give each cell the number
+// (column + 2 x row) mod 6. Beat 2 fills class 0, beat 3 class 3,
+// beat 4 class 1. Each class is a "knight's move" diagonal.
+// =====================================================================
+function act1(t) {
+  fillBg(WHITE);
+  // Filled modules first, so the lines sit on top of them.
+  const classes = [0, 3, 1];
+  for (let k = 0; k < 3; k++) {
+    // pops in on beats 2, 3, 4; capped at 1 so a module never spills past its cell
+    const p = Math.min(1, land(t, (k + 1) * BEAT, 0.25));
+    if (p <= 0) continue;
+    ctx.fillStyle = BLACK;
+    for (let r = 0; r < 8; r++) for (let c = 0; c < 6; c++) {
+      if ((c + 2 * r) % 6 !== classes[k]) continue;
+      const cx = gx(c) + COL / 2, cy = gy(r) + ROW / 2;  // grow from cell centre
+      const w = COL * p, h = ROW * p;
+      ctx.fillRect(cx - w / 2, cy - h / 2, w, h);
+    }
+  }
+  // Grid lines: verticals drop from the top, horizontals shoot from the left,
+  // each a few ms after the previous one. All done within ~0.3 s of beat 1.
+  ctx.fillStyle = BLACK;
+  for (let i = 0; i <= 6; i++) {
+    const p = easeOut(clamp01((t - i * 0.015) / 0.22));
+    ctx.fillRect(gx(i) - 1.5, MARGIN, 3, (H - 2 * MARGIN) * p);
+  }
+  for (let j = 0; j <= 8; j++) {
+    const p = easeOut(clamp01((t - 0.04 - j * 0.015) / 0.22));
+    ctx.fillRect(MARGIN, gy(j) - 1.5, (W - 2 * MARGIN) * p, 3);
+  }
+}
+
+// =====================================================================
+// ACT 2 — CIRCLES (2.667 to 5.333 s)
+// Concentric discs grow from the bottom-left grid corner. Every beat all
+// existing rings grow one unit (2 columns = 320 px) and a new ring is born
+// in the centre. Beat 1 grows double. Colours alternate black/white;
+// on beat 4 ring number 1 turns red.
+// =====================================================================
+function act2(t) {
+  const u = t - BAR;
+  fillBg(WHITE);
+  const UNIT = 2 * COL;
+  const cx = gx(0), cy = gy(8);           // bottom-left grid node
+  const radii = [0, 0, 0, 0];
+  for (let k = 0; k < 4; k++) {
+    // beat 1 is the act's cut: use hit(); later beats anticipate with land()
+    const step = k === 0 ? 2 * hit(u, 0) : land(u, k * BEAT, 0.3);
+    for (let i = 0; i <= k; i++) radii[i] += UNIT * step;
+  }
+  for (let i = 0; i < 4; i++) {           // biggest first, smaller on top
+    if (radii[i] <= 0) continue;
+    let col = i % 2 === 0 ? BLACK : WHITE;
+    if (i === 1 && u >= 3 * BEAT) col = RED;   // hard colour change on beat 4
+    ctx.fillStyle = col;
+    ctx.beginPath(); ctx.arc(cx, cy, radii[i], 0, Math.PI * 2); ctx.fill();
+  }
+}
+
+// =====================================================================
+// ACT 3 — CONTRAST (5.333 to 8 s)
+// Black field. One giant white letter per beat, each at a different extreme
+// scale and cropped by the frame, then a tiny red square. Hard cuts on beats.
+// =====================================================================
+const BIG = [
+  // letter, font size, left x, baseline y  (all placed on grid lines)
+  { ch: 'R', size: 1900, x: gx(1), y: gy(8) + 380 },
+  { ch: 'T', size: 1250, x: gx(2), y: gy(6) },
+  { ch: 'G', size: 3400, x: gx(0) - 1500, y: gy(8) + 1050 },
+];
+function act3(t) {
+  const u = t - 2 * BAR;
+  fillBg(BLACK);
+  const k = Math.min(3, Math.floor(u / BEAT + 1e-9)); // which beat we are on
+  const p = hit(u, k * BEAT);                         // spring after the cut
+  if (k < 3) {
+    const L = BIG[k];
+    const s = lerp(1.12, 1, p);         // lands from 12% too big
+    ctx.save();
+    ctx.translate(L.x, L.y); ctx.scale(s, s);
+    textAt(L.ch, 0, 0, L.size, true, WHITE);
+    ctx.restore();
+  } else {
+    // the tiny red square: one quarter of a column, top-left on a grid node
+    const side = 40 * p;
+    ctx.fillStyle = RED;
+    ctx.fillRect(gx(4), gy(5), side, side);
+  }
+}
+
+// =====================================================================
+// ACT 4 — RHYTHM (8 to 10.667 s)
+// RASTER / TRAME / GRIGLIA as a texture: two sizes, flush left.
+// Beat 1: a thick red rule sweeps across. Beat 2: the rule jumps up.
+// Beat 3: the text block rotates 90 degrees and locks to the grid.
+// Beat 4: the rule jumps to the top margin and doubles in weight.
+// =====================================================================
+const SLOT = ROW / 2;   // half a grid row per text line
+const LINES = [
+  // [slot, big?, text]
+  [0, true, 'RASTER RASTER RASTER'],
+  [1, false, 'TRAME TRAME TRAME TRAME TRAME TRAME TRAME TRAME'],
+  [2, false, 'GRIGLIA GRIGLIA GRIGLIA GRIGLIA GRIGLIA'],
+  [3, true, 'TRAME TRAME TRAME'],
+  [5, false, 'RASTER RASTER RASTER RASTER RASTER RASTER'],
+  [6, true, 'GRIGLIA GRIGLIA'],
+  [7, false, 'TRAME TRAME TRAME TRAME TRAME TRAME TRAME'],
+  [8, false, 'TRAME TRAME'],
+  [9, true, 'RASTER RASTER'],
+  [11, false, 'GRIGLIA GRIGLIA GRIGLIA GRIGLIA GRIGLIA'],
+];
+function textBlock() {
+  // drawn in local coordinates: (0,0) is the flush-left top corner
+  for (const [slot, big, str] of LINES) {
+    const size = big ? 104 : 34;
+    textAt(str, 0, (slot + 1) * SLOT - (big ? 2 : 22), size, big, BLACK);
+  }
+}
+function act4(t) {
+  const u = t - 3 * BAR;
+  fillBg(WHITE);
+  // Text block: upright at the top-left margin, then rotated -90 degrees
+  // so it reads bottom-to-top with its flush edge on the bottom margin.
+  const r = land(u, 2 * BEAT, 0.12);
+  ctx.save();
+  ctx.translate(gx(0), lerp(gy(0), gy(8), r));
+  ctx.rotate(-Math.PI / 2 * r);
+  textBlock();
+  ctx.restore();
+
+  // The red rule.
+  const sweep = hit(u, 0);                       // beat 1: sweeps left to right
+  const up = land(u, BEAT, 0.25);                // beat 2: jumps up to row 2
+  const drop = land(u, 3 * BEAT, 0.25);          // beat 4: to the top margin, thicker
+  let y = lerp(gy(7), gy(2), up);
+  y = lerp(y, gy(0), drop);
+  const th = lerp(40, 80, drop);
+  ctx.fillStyle = RED;
+  ctx.fillRect(gx(0), y, (W - 2 * MARGIN) * clamp01(sweep * 1.05), th);
+}
+
+// =====================================================================
+// ACT 5 — SERIES (10.667 to 13.333 s)
+// A 4x4 square of modules. Colour of module (i, j) = SERIES[(i + j + step) mod 6],
+// where step goes up by one on every half-beat: diagonal colour bands march
+// through the square. Beat 1: square slams in. Beat 2: gutters open.
+// Beat 3: rotates 45 degrees. Beat 4: snaps back.
+// =====================================================================
+function act5(t) {
+  const u = t - 4 * BAR;
+  fillBg(WHITE);
+  const HALF = BEAT / 2;
+  const step = Math.floor(u / HALF + 1e-9);          // 0..7, a new step each half-beat
+  const pulse = hit(u, step * HALF);                  // tiny kick on every half-beat
+  const enter = hit(u, 0);                            // beat 1
+  const gutter = 10 * land(u, BEAT, 0.3);             // beat 2
+  const rot = Math.PI / 4 * (land(u, 2 * BEAT, 0.15) - land(u, 3 * BEAT, 0.35)); // beats 3, 4
+  const S = 4 * COL, M = COL;                         // 640 px square, 160 px modules
+  ctx.save();
+  ctx.translate(gx(3), gy(4));                        // centre of frame = grid node
+  ctx.rotate(rot);
+  ctx.scale(enter, enter);
+  for (let j = 0; j < 4; j++) for (let i = 0; i < 4; i++) {
+    ctx.fillStyle = SERIES[(i + j + step) % 6];
+    // modules shrink slightly then spring back on each half-beat
+    const m = (M - gutter) * lerp(0.9, 1, pulse);
+    const x = -S / 2 + i * M + M / 2, y = -S / 2 + j * M + M / 2;
+    ctx.fillRect(x - m / 2, y - m / 2, m, m);
+  }
+  ctx.restore();
+}
+
+// =====================================================================
+// ACT 6 — LOCKUP (13.333 to 16 s)
+// Final composition, slow push for three beats, then a white wipe
+// clears everything so that t = 16 is plain white, exactly like t = 0.
+// =====================================================================
+function act6(t) {
+  const u = t - 5 * BAR;
+  fillBg(WHITE);
+  const push = 1 + 0.04 * easeInOut(clamp01(u / (3 * BEAT)));  // slow push
+  ctx.save();
+  ctx.translate(gx(3), gy(4)); ctx.scale(push, push); ctx.translate(-gx(3), -gy(4));
+
+  // Beat 1: RASTER slides in from the right and lands, cropped by the frame.
+  const a = hit(u, 0);
+  textAt('RASTER', lerp(gx(6), gx(0), a), gy(3), 330, true, BLACK);
+  textAt('TRAME', lerp(gx(-3), gx(0), a), gy(5), 96, true, BLACK);
+  textAt('GRIGLIA', lerp(gx(-4), gx(0), a), gy(6), 96, false, BLACK);
+
+  // On beat 4 the red elements are cut away first (a hard cut on the beat),
+  // then the white wipe below clears the black type.
+  const redOn = u < 3 * BEAT;
+
+  // The red rule: in on beat 1, extends to the right margin on beat 3.
+  const ext = land(u, 2 * BEAT, 0.25);
+  ctx.fillStyle = redOn ? RED : WHITE;
+  ctx.fillRect(gx(0), gy(3) + ROW / 2 - 20, (lerp(gx(4), gx(6), ext) - gx(0)) * clamp01(a), 40);
+
+  // Beat 2: the red circle springs in on a grid node.
+  const c = land(u, BEAT, 0.3);
+  if (c > 0 && redOn) {
+    ctx.beginPath(); ctx.arc(gx(5), gy(6), COL * c, 0, Math.PI * 2); ctx.fill();
+  }
+
+  // Beat 3: small caption, flush left on the bottom margin.
+  if (land(u, 2 * BEAT) > 0.5)
+    textAt('90 BPM — 4/4 — 16 s', gx(0), gy(8), 28, false, BLACK);
+  ctx.restore();
+
+  // Beat 4: a white panel wipes down from the top (an exit: ease, no spring).
+  // It is complete at 15.95 s, so 15.95..16 and 0 are all plain white.
+  const w = easeInOut(clamp01((u - (3 * BEAT - LEAD)) / (BEAT + LEAD - 0.05)));
+  if (w > 0) { ctx.fillStyle = WHITE; ctx.fillRect(0, 0, W, H * w); }
+}
+
+// =====================================================================
+// seek(t): THE single entry point. Picks the act from t and paints it.
+// =====================================================================
+const ACTS = [act1, act2, act3, act4, act5, act6];
+let current = 0;                      // last time painted (used by keys/overlay)
+window.seek = function (t) {
+  t = ((t % LOOP) + LOOP) % LOOP;     // wrap into 0..16
+  current = t;
+  const act = Math.min(5, Math.floor(t / BAR + 1e-9));
+  ctx.save();
+  ACTS[act](t);
+  ctx.restore();
+  // overlay text: bar.beat (1-based)
+  const b = Math.floor(t / BEAT + 1e-9);
+  overlay.textContent = (Math.floor(b / 4) + 1) + '.' + (b % 4 + 1);
+};
+
+// =====================================================================
+// Playback: requestAnimationFrame, t = elapsed seconds mod 16.
+// "base" is the clock reading that corresponds to t = 0.
+// =====================================================================
+const overlay = document.getElementById('overlay');
+let paused = false;
+let base = performance.now() / 1000;
+const nowS = () => performance.now() / 1000;
+const playT = () => paused ? current : (((nowS() - base) % LOOP) + LOOP) % LOOP;
+function setT(t) { t = ((t % LOOP) + LOOP) % LOOP; base = nowS() - t; current = t; resetClicks(); }
+
+function frame() {
+  const t = playT();
+  seek(t);
+  if (!paused) scheduleClicks(t);
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+// =====================================================================
+// Metronome (M): Web Audio clicks, scheduled a little ahead of time.
+// Beat 1 of each bar is louder and higher.
+// =====================================================================
+let audio = null, metro = false, nextBeat = -1;
+function resetClicks() { nextBeat = -1; }
+function click(when, accent) {
+  const o = audio.createOscillator(), g = audio.createGain();
+  o.frequency.value = accent ? 1600 : 1000;
+  g.gain.setValueAtTime(accent ? 0.6 : 0.25, when);
+  g.gain.exponentialRampToValueAtTime(0.001, when + 0.05);
+  o.connect(g); g.connect(audio.destination);
+  o.start(when); o.stop(when + 0.06);
+}
+function scheduleClicks(t) {
+  if (!metro || !audio) return;
+  // absolute beat count since the clock base, so the loop wrap is seamless
+  const abs = nowS() - base;
+  if (nextBeat < 0) nextBeat = Math.ceil(abs / BEAT - 1e-6);
+  while (nextBeat * BEAT < abs + 0.12) {          // look 120 ms ahead
+    const delay = nextBeat * BEAT - abs;
+    if (delay >= -0.01) click(audio.currentTime + Math.max(0, delay), nextBeat % 4 === 0);
+    nextBeat++;
+  }
+}
+
+// =====================================================================
+// Keys: Space pause, arrows step one beat, M metronome, D overlay.
+// =====================================================================
+window.addEventListener('keydown', e => {
+  if (e.code === 'Space') {
+    e.preventDefault();
+    if (paused) { paused = false; setT(current); } else { current = playT(); paused = true; }
+  } else if (e.code === 'ArrowRight' || e.code === 'ArrowLeft') {
+    e.preventDefault();
+    const b = Math.round(playT() / BEAT) + (e.code === 'ArrowRight' ? 1 : -1);
+    setT(b * BEAT);
+    seek(current);
+  } else if (e.code === 'KeyM') {
+    if (!audio) audio = new (window.AudioContext || window.webkitAudioContext)();
+    audio.resume();
+    metro = !metro; resetClicks();
+  } else if (e.code === 'KeyD') {
+    overlay.style.display = overlay.style.display === 'block' ? 'none' : 'block';
+  }
+});
+</script>
+</body>
+</html>
