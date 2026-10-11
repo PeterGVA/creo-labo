@@ -9,3 +9,4 @@ Label is the letter shown in the gallery (see `index.html`).
 | B     | Opus   |         |            |          |
 | C     | Haiku  |         |            |          |
 | D     | Sonnet |         |            |          |
+| E     | Haiku 5.5 solo |   |            |          |
