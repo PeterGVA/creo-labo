@@ -1,0 +1,296 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Swiss Grid in Motion</title>
+<style>
+  /* The page is plain white. The poster is centered and scaled to fit the window. */
+  html, body {
+    margin: 0;
+    height: 100%;
+    background: #ffffff;
+    overflow: hidden;
+  }
+  #stage {
+    position: fixed;
+    left: 50%;
+    top: 50%;
+    transform: translate(-50%, -50%);
+  }
+  canvas {
+    display: block;
+  }
+</style>
+</head>
+<body>
+<div id="stage">
+  <canvas id="c"></canvas>
+</div>
+
+<script>
+// =====================================================================
+// SWISS GRID IN MOTION
+// The whole picture is drawn again on every frame from one number: t,
+// the time in seconds (0 to 6). Nothing remembers the last frame, so the
+// picture at t = 6 is exactly the picture at t = 0, and the loop is seamless.
+// =====================================================================
+
+// ---------- 1. Basic settings ----------
+const W = 1080;               // poster width in pixels
+const H = 1350;               // poster height in pixels (4:5 portrait)
+const LOOP = 6;               // the animation repeats every 6 seconds
+
+// The three colors allowed by the brief (plus ink tints made from ink)
+const GROUND = '#ffffff';     // white background
+const INK = '#111111';        // black text and lines
+const ACCENT = '#e30613';     // the one red circle
+
+const FONT = 'Helvetica, Arial, sans-serif';
+
+// ---------- 2. The 6-column grid ----------
+const MARGIN = 60;            // empty space on the left and right edges
+const GUTTER = 24;            // empty space between two columns
+const COLS = 6;
+// Width of one column: what is left after margins and gutters, divided by 6
+const COL_W = (W - 2 * MARGIN - (COLS - 1) * GUTTER) / COLS;   // = 140
+// Left edge of column i (i counts from 0, so column 5 is i = 4)
+const colX = i => MARGIN + i * (COL_W + GUTTER);
+
+// ---------- 3. Vertical positions (the "baseline" is the line letters sit on) ----------
+const Y_GRID_START = 560;     // GRID while it drops in
+const Y_GRID_END = 420;       // GRID after it slides up
+const Y_RHYTHM = 600;         // RHYTHM, stacked under GRID
+const Y_TIME = 800;           // TIME, stacked under RHYTHM
+const Y_RULE = 660;           // the flat line the red circle rolls on
+const R = 40;                 // radius of the red circle
+
+// ---------- 4. Helper tools (small math, all based on time) ----------
+
+// Keep a number between 0 and 1
+const clamp01 = x => Math.max(0, Math.min(1, x));
+
+// Progress from 0 to 1 while time goes from a to b.
+// Before a it is 0, after b it is 1.
+const prog = (t, a, b) => clamp01((t - a) / (b - a));
+
+// Easing curves: they change the speed of a movement.
+// "Out" = fast start, slow end. "In" = slow start, fast end.
+const easeOutCubic = p => 1 - Math.pow(1 - p, 3);
+const easeInCubic = p => p * p * p;
+const easeInOutCubic = p => (p < 0.5 ? 4 * p * p * p : 1 - Math.pow(-2 * p + 2, 3) / 2);
+// "Back" overshoots the target a little and then settles, like a snap
+const easeOutBack = p => {
+  const c1 = 1.70158;
+  const c3 = c1 + 1;
+  return 1 + c3 * Math.pow(p - 1, 3) + c1 * Math.pow(p - 1, 2);
+};
+
+// A damped spring. Something starts pushed away by `from` and wobbles
+// back to rest (0). Before its start time it waits at `from`.
+// zeta = how fast the wobble dies (bigger = calmer)
+// omega = how fast it wobbles (bigger = quicker)
+function spring(t, start, from, zeta = 0.45, omega = 14) {
+  const tau = t - start;            // seconds since the spring started
+  if (tau <= 0) return from;        // not started yet: stay where it begins
+  const wd = omega * Math.sqrt(1 - zeta * zeta);
+  return from * Math.exp(-zeta * omega * tau) *
+    (Math.cos(wd * tau) + (zeta * omega / wd) * Math.sin(wd * tau));
+}
+
+// ---------- 5. Set up the canvas ----------
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+// dpr = screen sharpness (2 on many phones and Macs). We draw at that
+// resolution so the text stays crisp.
+const dpr = window.devicePixelRatio || 1;
+canvas.width = W * dpr;
+canvas.height = H * dpr;
+
+// Scale the drawing so it fits the window with its shape kept
+function fitToWindow() {
+  const scale = Math.min(window.innerWidth / W, window.innerHeight / H);
+  canvas.style.width = (W * scale) + 'px';
+  canvas.style.height = (H * scale) + 'px';
+}
+window.addEventListener('resize', fitToWindow);
+fitToWindow();
+
+// ---------- 6. Text helpers ----------
+
+// Set the font for a given size in pixels
+function setFont(size) {
+  ctx.font = `bold ${size}px ${FONT}`;
+}
+
+// Draw one piece of text at a position, with an opacity from 0 to 1
+function drawText(str, size, x, y, alpha = 1) {
+  setFont(size);
+  ctx.fillStyle = INK;
+  ctx.globalAlpha = alpha;
+  ctx.fillText(str, x, y);
+  ctx.globalAlpha = 1;
+}
+
+// Find the left x of every letter in a word, so each letter can move on its own.
+// Each letter starts where the text before it ends.
+function letterXs(word, size) {
+  setFont(size);
+  const xs = [];
+  for (let i = 0; i < word.length; i++) {
+    xs.push(MARGIN + ctx.measureText(word.slice(0, i)).width);
+  }
+  return xs;
+}
+
+// Precompute letter positions once (they never change)
+const GRID_SIZE = 340;
+const GRID_XS = letterXs('GRID', GRID_SIZE);
+const GRID_LETTERS = ['G', 'R', 'I', 'D'];
+// Start time of each letter's drop: one after another, 0.3 s apart
+const DROP_START = [0.4, 0.7, 1.0, 1.3];
+
+// ---------- 7. The picture for one moment in time ----------
+function render(t) {
+  // Reset the canvas to the right size and paint the white background
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.fillStyle = GROUND;
+  ctx.fillRect(0, 0, W, H);
+
+  // --- Whole-layout rotation (45 degrees and back, beat 3.8 to 5.0) ---
+  let rot = 0;                                     // in degrees
+  if (t >= 3.8 && t < 4.3) {
+    rot = 45 * easeOutBack(prog(t, 3.8, 4.3));     // snap out to 45 deg, overshoot a touch
+  } else if (t >= 4.3 && t < 5.0) {
+    rot = 45 * (1 - easeInOutCubic(prog(t, 4.3, 5.0)));  // swing back to 0
+  }
+
+  // --- Exit upward (beat 5.0 to 6.0). Letters fly off the top of the frame. ---
+  const exitY = -1500 * easeInCubic(prog(t, 5.0, 6.0));
+
+  // Everything below is drawn inside the rotation, around the center of the poster
+  ctx.save();
+  ctx.translate(W / 2, H / 2);
+  ctx.rotate(rot * Math.PI / 180);
+  ctx.translate(-W / 2, -H / 2);
+
+  // --- Beat 0.0 to 0.4: faint column lines draw down from the top ---
+  const lineGrow = easeOutCubic(prog(t, 0.0, 0.4));
+  // Beat 5.0 to 5.8: the lines fade away
+  const lineFade = 1 - easeInOutCubic(prog(t, 5.0, 5.8));
+  ctx.strokeStyle = INK;
+  ctx.globalAlpha = 0.15 * lineFade;               // a light tint of ink
+  ctx.lineWidth = 1;
+  for (let i = 0; i < COLS; i++) {
+    const x = colX(i) + 0.5;                       // +0.5 keeps the 1px line sharp
+    ctx.beginPath();
+    ctx.moveTo(x, 0);
+    ctx.lineTo(x, H * lineGrow);
+    ctx.stroke();
+  }
+  ctx.globalAlpha = 1;
+
+  // --- GRID: each letter drops in from above (beat 0.4 to 1.6) ---
+  // Then GRID slides up (beat 2.6 to 3.4) and lands at Y_GRID_END
+  const gridSlide = (Y_GRID_END - Y_GRID_START) * easeOutBack(prog(t, 2.6, 3.4));
+  for (let i = 0; i < GRID_LETTERS.length; i++) {
+    const drop = spring(t, DROP_START[i], -700);   // starts 700 px above, springs down
+    const y = Y_GRID_START + drop + gridSlide + exitY;
+    drawText(GRID_LETTERS[i], GRID_SIZE, GRID_XS[i], y);
+  }
+
+  // --- The flat line and the red circle (beat 1.5 to 3.0) ---
+  // They appear, the circle rolls, then both fade away while GRID slides up
+  const appear = easeOutCubic(prog(t, 1.5, 1.7));
+  const gone = 1 - easeInOutCubic(prog(t, 2.6, 3.0));
+  const show = appear * gone;
+
+  // The flat line (the "baseline" the circle rolls along)
+  ctx.globalAlpha = show;
+  ctx.fillStyle = INK;
+  ctx.fillRect(MARGIN, Y_RULE - 2, W - 2 * MARGIN, 4);
+  ctx.globalAlpha = 1;
+
+  // The circle's center starts at the left margin and stops at column 5.
+  // Its left edge then lines up with the left edge of column 5.
+  const startCx = MARGIN + R;
+  const endCx = colX(4) + R;
+  const rollP = prog(t, 1.6, 2.6);                 // 0 to 1 while it rolls
+  const cx = startCx + (endCx - startCx) * easeOutCubic(rollP);
+  const cy = Y_RULE - R;                           // sits on top of the line
+  const spin = (cx - startCx) / R;                 // radians turned (distance / radius)
+
+  ctx.globalAlpha = show;
+  ctx.fillStyle = ACCENT;
+  ctx.beginPath();
+  ctx.arc(cx, cy, R, 0, Math.PI * 2);
+  ctx.fill();
+  // A white spoke shows the circle turning as it rolls
+  ctx.save();
+  ctx.translate(cx, cy);
+  ctx.rotate(spin);
+  ctx.strokeStyle = GROUND;
+  ctx.lineWidth = 6;
+  ctx.beginPath();
+  ctx.moveTo(0, 0);
+  ctx.lineTo(R * 0.85, 0);
+  ctx.stroke();
+  ctx.restore();
+  ctx.globalAlpha = 1;
+
+  // --- RHYTHM and TIME: stack under GRID, one after the other (beat 2.6 to 3.8) ---
+  // They come up from below the frame and settle with a small wobble
+  const rhythmY = Y_RHYTHM + spring(t, 2.8, 1000, 0.6, 16);
+  drawText('RHYTHM', 150, MARGIN, rhythmY + exitY);
+
+  const timeY = Y_TIME + spring(t, 3.0, 1000, 0.6, 16);
+  drawText('TIME', 150, MARGIN, timeY + exitY);
+
+  ctx.restore();   // end of the rotated layout
+}
+
+// ---------- 8. Time control ----------
+let t = 0;                 // current moment, always between 0 and 6
+let playing = true;        // true = time moves on by itself
+let lastStamp = null;      // time of the previous animation frame
+
+// Jump to any moment. The number wraps around, so -1 means 5 and 7 means 1.
+// Calling this stops the automatic movement, so you can look at one frame.
+function seek(sec) {
+  playing = false;
+  t = ((sec % LOOP) + LOOP) % LOOP;
+  render(t);
+}
+// Make seek available to the outside world (the brief asks for window.seek)
+window.seek = seek;
+
+// The animation loop: the browser calls this about 60 times per second
+function frame(stamp) {
+  if (lastStamp !== null && playing) {
+    // Add the time since the last frame. Limit it to 0.1 s so a stalled tab
+    // does not jump the picture forward.
+    const dt = Math.min(0.1, (stamp - lastStamp) / 1000);
+    t = (t + dt) % LOOP;
+  }
+  lastStamp = stamp;
+  render(t);
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+// Keyboard: Space pauses or plays, left and right arrows step 1/30 second
+window.addEventListener('keydown', e => {
+  if (e.code === 'Space') {
+    e.preventDefault();
+    playing = !playing;
+  } else if (e.code === 'ArrowRight') {
+    e.preventDefault();
+    seek(t + 1 / 30);
+  } else if (e.code === 'ArrowLeft') {
+    e.preventDefault();
+    seek(t - 1 / 30);
+  }
+});
+</script>
+</body>
+</html>
