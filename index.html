@@ -39,12 +39,15 @@
   <button id="reveal">Reveal</button>
 </header>
 
-<!-- Row 1: the first round. Row 2: the second round. Both are filled in by the script below. -->
+<!-- Row 1: the first round. Row 2: the second round. Row 3: the third round. All are filled in by the script below. -->
 <h2>Round 1 – Swiss Grid</h2>
 <div class="gallery" id="gallery1"></div>
 
 <h2>Round 2 – Swiss Hero Spot</h2>
 <div class="gallery" id="gallery2"></div>
+
+<h2>Round 3 – Swiss Machine</h2>
+<div class="gallery" id="gallery3"></div>
 
 <script>
   // Round 1: the four setups = the four folder names inside pieces/swiss-grid/.
@@ -65,6 +68,13 @@
     { label: "sonnet-high", folder: "sonnet-high" },
     { label: "haiku-high",  folder: "haiku-high" },
     { label: "opus-medium", folder: "opus-medium" }
+  ];
+
+  // Round 3: three setups, fixed order (no shuffling), labelled with their folder names.
+  var machineVersions = [
+    { label: "opus-high",   folder: "opus-high" },
+    { label: "sonnet-high", folder: "sonnet-high" },
+    { label: "haiku-high",  folder: "haiku-high" }
   ];
 
   var revealed = false;      // starts hidden; the button flips it
@@ -122,6 +132,7 @@
 
   buildRow("gallery1", "swiss-grid", versions, true);
   buildRow("gallery2", "swiss-hero", heroVersions, false);
+  buildRow("gallery3", "swiss-machine", machineVersions, false);
 
   // The Reveal button (Round 1 only) toggles between "A" and "A: Team".
   document.getElementById("reveal").addEventListener("click", function () {
