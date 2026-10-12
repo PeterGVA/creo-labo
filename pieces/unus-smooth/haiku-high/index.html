@@ -1,0 +1,772 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Unus Smooth</title>
+<style>
+  /* Page setup: black surround, picture centred, no scrollbars. */
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  #wrap { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; }
+  #stage { position: relative; }
+  canvas { display: block; }
+  /* Tap buttons: a row along the bottom of the picture. They fade in and out from JavaScript. */
+  #bar { position: absolute; left: 0; right: 0; bottom: 0; display: flex; flex-wrap: wrap;
+         gap: 6px; justify-content: center; padding: 10px; opacity: 0; }
+  #bar button { min-height: 44px; min-width: 44px; padding: 0 12px; border-radius: 0;
+                font: 700 15px "Helvetica Neue", Helvetica, Arial, sans-serif;
+                color: #fff; background: #111111; border: 1px solid #fff; }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <div id="stage">
+    <canvas id="c"></canvas>
+    <div id="bar">
+      <button id="b-play">Pause</button>
+      <button id="b-prev">&lt; Beat</button>
+      <button id="b-next">Beat &gt;</button>
+      <button id="b-d">D</button>
+      <button id="b-m">M</button>
+      <button id="b-f">F</button>
+    </div>
+  </div>
+</div>
+<script>
+"use strict";
+
+/* ===================== 1. SETTINGS ===================== */
+const W = 1080, H = 1350;             // the picture is 1080 x 1350 "frame pixels"
+const M = 135;                        // empty margin on every side
+const CELL = 135;                     // one grid cell: 6 columns x 8 rows fit the live area
+const HALF = CELL / 2;                // 67.5: grid lines and cell centres are multiples of this
+const INSET = 9;                      // a resting shape sits this far inside its cell edges
+const BEAT = 2 / 3;                   // one beat at 90 BPM, in seconds
+const LOOP = 16;                      // the piece loops every 16 seconds
+const WHITE = '#ffffff', BLACK = '#111111', RED = '#e30613';
+const SIZES = [52, 84, 136];          // the only text sizes allowed at rest
+const FONT = '"Helvetica Neue", Helvetica, Arial, sans-serif';
+const LIVE = { x: M, y: M, w: 810, h: 1080 };   // the live area inside the margins
+
+/* ===================== 2. SMALL MATH HELPERS ===================== */
+function clamp01(p) { return p < 0 ? 0 : p > 1 ? 1 : p; }
+function ease(p) { p = clamp01(p); return p * p * (3 - 2 * p); }     // smooth start and smooth stop
+function prog(t, t0, t1) { return ease((t - t0) / (t1 - t0)); }      // 0..1 eased between t0 and t1
+function lerp(a, b, p) { return a + (b - a) * p; }
+function wrap(t) { t = t % LOOP; return t < 0 ? t + LOOP : t; }
+function cellX(c) { return M + c * CELL; }                            // left edge of column c
+function cellY(r) { return M + r * CELL; }                            // top edge of row r
+// The resting box of a block of cells, shrunk by INSET on all four sides
+function block(c, r, w = 1, h = 1) {
+  return { x: cellX(c) + INSET, y: cellY(r) + INSET, w: w * CELL - 2 * INSET, h: h * CELL - 2 * INSET };
+}
+// Hit envelope: 1 exactly on a hit time, falling to 0 over 0.1 s either side (fades, never pops)
+function hitEnv(t, hits) {
+  let best = 0;
+  for (const h of hits) best = Math.max(best, 1 - Math.abs(t - h) / 0.1);
+  return clamp01(best);
+}
+
+/* ===================== 3. DRAWING HELPERS (each one draws AND records) ===================== */
+let ctx = null;           // the 2D drawing context (set at start-up)
+let canvas = null;
+let recs = [];           // everything the current frame drew, one record per outline
+let drawOn = true;       // false = only record, do not paint (used by frameCheck)
+
+function rec(r) { recs.push(r); return r; }
+
+// Set the font. Only bold (700) and regular (400) are used.
+function setFont(size, bold) { ctx.font = `${bold ? 700 : 400} ${size}px ${FONT}`; }
+
+// Measure a word's real ink box with measureText (not a guess)
+function measure(str, size, bold = true) {
+  setFont(size, bold);
+  const m = ctx.measureText(str);
+  return {
+    width: m.width,
+    left: m.actualBoundingBoxLeft,      // ink reach to the left of the start point
+    right: m.actualBoundingBoxRight,    // ink reach to the right of the start point
+    asc: m.actualBoundingBoxAscent,     // ink reach above the baseline
+    desc: m.actualBoundingBoxDescent    // ink reach below the baseline (the comma goes here)
+  };
+}
+
+// Draw a word. (x, y) is its start point on the baseline.
+function text(id, str, x, y, size, color, alpha = 1, bold = true) {
+  if (alpha <= 0.001) return;
+  const m = measure(str, size, bold);
+  if (drawOn) {
+    setFont(size, bold);
+    ctx.globalAlpha = alpha;
+    ctx.fillStyle = color;
+    ctx.fillText(str, x, y);
+  }
+  rec({ id, kind: 'text', str, size, color, alpha,
+        x: x - m.left, y: y - m.asc, w: m.left + m.right, h: m.asc + m.desc });
+}
+
+// Draw a flat rectangle (x, y = top-left corner)
+function rect(id, x, y, w, h, color, alpha = 1) {
+  if (alpha <= 0.001 || w <= 0 || h <= 0) return;
+  if (drawOn) { ctx.globalAlpha = alpha; ctx.fillStyle = color; ctx.fillRect(x, y, w, h); }
+  rec({ id, kind: 'rect', color, alpha, x, y, w, h });
+}
+
+// Draw a filled circle (cx, cy = centre)
+function circle(id, cx, cy, r, color, alpha = 1) {
+  if (alpha <= 0.001 || r <= 0) return;
+  if (drawOn) {
+    ctx.globalAlpha = alpha; ctx.fillStyle = color;
+    ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI * 2); ctx.fill();
+  }
+  rec({ id, kind: 'circle', color, alpha, cx, cy, r, x: cx - r, y: cy - r, w: 2 * r, h: 2 * r });
+}
+
+// Draw a straight line with thickness th
+function line(id, x1, y1, x2, y2, th, color, alpha = 1) {
+  if (alpha <= 0.001 || th <= 0) return;
+  if (drawOn) {
+    ctx.globalAlpha = alpha; ctx.strokeStyle = color; ctx.lineWidth = th;
+    ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2); ctx.stroke();
+  }
+  const h = th / 2;
+  rec({ id, kind: 'line', color, alpha, x1, y1, x2, y2, th,
+        x: Math.min(x1, x2) - h, y: Math.min(y1, y2) - h,
+        w: Math.abs(x2 - x1) + th, h: Math.abs(y2 - y1) + th });
+}
+
+// Draw a filled closed outline through a list of [x, y] points
+function path(id, pts, color, alpha = 1) {
+  if (alpha <= 0.001) return;
+  let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+  for (const [x, y] of pts) {
+    x0 = Math.min(x0, x); y0 = Math.min(y0, y);
+    x1 = Math.max(x1, x); y1 = Math.max(y1, y);
+  }
+  if (drawOn) {
+    ctx.globalAlpha = alpha; ctx.fillStyle = color;
+    ctx.beginPath();
+    pts.forEach(([x, y], i) => (i ? ctx.lineTo(x, y) : ctx.moveTo(x, y)));
+    ctx.closePath(); ctx.fill();
+  }
+  rec({ id, kind: 'path', color, alpha, x: x0, y: y0, w: x1 - x0, h: y1 - y0 });
+}
+
+// The background field fills the whole frame. mix 0 = white, 1 = black (#111111).
+function field(mix) {
+  const v = Math.round(255 - (255 - 17) * mix);
+  const color = `rgb(${v},${v},${v})`;
+  if (drawOn) { ctx.globalAlpha = 1; ctx.fillStyle = color; ctx.fillRect(0, 0, W, H); }
+  rec({ id: 'bg', kind: 'field', mix, color, alpha: 1, x: 0, y: 0, w: W, h: H });
+}
+
+// A small hi-hat mark (24 px square) centred on (cx, cy). It blinks at each hit time.
+function hat(id, cx, cy, t, hits, color = RED) {
+  rect(id, cx - 12, cy - 12, 24, 24, color, hitEnv(t, hits));
+}
+
+/* ===================== 4. ONE FRAME = ONE FUNCTION OF t ===================== */
+// Background: goes to black over 22/3 .. 8 and back to white over 38/3 .. 40/3
+function bgMix(t) {
+  return prog(t, 22 / 3, 8) - prog(t, 38 / 3, 40 / 3);
+}
+
+// Paint frame t (or only record it) and return what the frame contains
+function compose(t, paint) {
+  t = wrap(t);
+  drawOn = paint;
+  recs = [];
+  if (paint) ctx.globalAlpha = 1;
+  field(bgMix(t));
+  scene(t);
+  if (paint) ctx.globalAlpha = 1;
+  return recs;
+}
+
+// The acts are written in the next stage (scene draws every act for time t)
+/* ---------- shared helpers for the acts ---------- */
+
+// A grid square in cell (c, r). It grows from its own centre from tIn over dur seconds.
+// moves = [[start, end, cells], ...] slides it sideways by whole cells, eased.
+// tOut = when it starts to fade out (null = it stays).
+function tile(id, c, r, color, t, tIn, dur = 0.4, moves = [], tOut = null) {
+  let dc = 0;
+  for (const [a, b, n] of moves) dc += n * prog(t, a, b);
+  const b = block(c + dc, r);
+  const s = b.w * prog(t, tIn, tIn + dur);
+  const alpha = tOut === null ? 1 : 1 - prog(t, tOut, tOut + 0.25);
+  rect(id, b.x + (b.w - s) / 2, b.y + (b.h - s) / 2, s, s, color, alpha);
+}
+
+// A word that fades in from tIn and out from tOut (null = it stays). Each fade takes 0.25 s.
+function word(id, str, x, y, size, color, t, tIn, tOut = null, bold = true) {
+  const a = prog(t, tIn, tIn + 0.25) * (tOut === null ? 1 : 1 - prog(t, tOut, tOut + 0.25));
+  text(id, str, x, y, size, color, a, bold);
+}
+
+// Start x for a word so that its ink ends exactly at inkRight
+function rightX(str, size, inkRight) { return inkRight - measure(str, size).right; }
+
+// Outline for the act 5 morph: n = 2 is a circle, a large n is a square with soft corners
+function blob(cx, cy, half, n) {
+  const pts = [];
+  for (let i = 0; i < 120; i++) {
+    const a = (i / 120) * Math.PI * 2;
+    const c = Math.cos(a), s = Math.sin(a);
+    pts.push([cx + half * Math.sign(c) * Math.pow(Math.abs(c), 2 / n),
+              cy + half * Math.sign(s) * Math.pow(Math.abs(s), 2 / n)]);
+  }
+  return pts;
+}
+
+// The hit times of a pattern: start + k * step, for each k in ks
+function hitsOf(start, step, ks) { return ks.map(k => start + k * step); }
+
+// Hi-hat hit times for each act. The acts draw them and the metronome plays the same ones.
+const HATS = {
+  a1: hitsOf(0, BEAT / 2, [1, 2, 3, 4, 5, 6, 7]),                 // straight 8ths
+  a2: hitsOf(2.667, BEAT / 3, [1, 2, 3, 4, 5, 6, 7]),             // triplets
+  a3: hitsOf(5.333, BEAT / 4, [1, 2, 3, 5, 6, 7, 9, 10, 11]),     // 16ths, skipping the beats
+  a4: hitsOf(8.0, 0.75 * BEAT, [0, 1, 2, 3, 4]),                  // dotted 8ths
+  a5: hitsOf(10.667, BEAT / 4, [0.5, 1.5, 2.5, 3.5, 4.5, 5.5, 6.5, 7.5])   // off-beat 16ths
+};
+
+/* ---------- the modules of acts 3 to 5 (one set, so each keeps its id from act to act) ---------- */
+function modules(t) {
+  for (const r of [1, 2, 3, 4, 5, 6]) {
+    // Column 0: arrives on the kick (5.333). Row 3 steps right on the snare (6.0) and back (7.333).
+    // All of column 0 gathers one column to the right at 8.0 (moves start before the hit).
+    const mv0 = r === 3 ? [[5.733, 6.0, 1], [6.933, 7.333, -1], [7.6, 8.0, 1]] : [[7.6, 8.0, 1]];
+    tile('m0-' + r, 0, r, RED, t, 5.333, 0.4, mv0, 10.667);
+    // Column 2: arrives on the snare (6.0). It stays in place while the others gather.
+    tile('m2-' + r, 2, r, RED, t, 6.0, 0.4, [], 10.667);
+    // Column 5: arrives on the kick (5.333). It gathers two columns to the left at 8.0.
+    tile('m5-' + r, 5, r, RED, t, 5.333, 0.4, [[7.6, 8.0, -2]], 10.667);
+  }
+}
+
+/* ===================== ACT 1 (0 - 2.667): UNUS ===================== */
+// One red square lands on the grid. UNUS appears. Hi-hat: straight 8ths.
+function act1(t) {
+  tile('sq1', 1, 3, RED, t, 0, 0.9, [], 5.333);            // lands late, from plain white
+  word('w-unus', 'UNUS', 675, 505, 84, BLACK, t, 0.333, 2.667);
+  hat('h1', 877.5, 1012.5, t, HATS.a1);
+}
+
+/* ===================== ACT 2 (2.667 - 5.333): PRO OMNIBUS ===================== */
+// The square multiplies across the grid. Each new square grows in its own cell.
+// PRO and OMNIBUS, build word by word. Hi-hat: triplets.
+function act2(t) {
+  const sqs = [[4, 3, 2.667], [1, 5, 3.333], [4, 5, 4.0], [2, 1, 4.667], [5, 7, 5.0]];
+  for (const [c, r, t0] of sqs) tile('sq' + c + r, c, r, RED, t, t0, 0.4, [], 5.333);
+  word('w-pro', 'PRO', rightX('PRO', 84, 945), 245, 84, BLACK, t, 3.333, 6.667);
+  word('w-omnibus', 'OMNIBUS,', 135, 1150, 84, BLACK, t, 4.667, 6.667);
+  hat('h2', 607.5, 337.5, t, HATS.a2);
+}
+
+/* ===================== ACT 3 (5.333 - 8.0): MANY ===================== */
+// The modules (see modules()) fill the full width. Hi-hat: 16ths, skipping the beats.
+function act3(t) {
+  hat('h3', 607.5, 742.5, t, HATS.a3);
+}
+
+/* ===================== ACT 4 (8.0 - 10.667): OMNES ===================== */
+// Black field. The modules gather (see modules()). OMNES in white. Hi-hat: dotted 8ths.
+function act4(t) {
+  word('w-omnes', 'OMNES', rightX('OMNES', 84, 945), 245, 84, WHITE, t, 8.0, 10.0);
+  hat('h4', 877.5, 742.5, t, HATS.a4);
+}
+
+/* ===================== ACT 5 (10.667 - 13.333): PRO UNO ===================== */
+// The modules leave. One square (cell 2,7) morphs into a red circle at cells 1-2, 3-4.
+// PRO UNO. A thin red rule on the right edge keeps the balance until the background is white.
+// Hi-hat: off-beat 16ths.
+function act5(t) {
+  word('w-prouno', 'PRO UNO', rightX('PRO UNO', 84, 920), 245, 84, WHITE, t, 10.667, 12.0);
+  // The rule fades in, and out during the background change (shapes may stay then)
+  const ruleAlpha = prog(t, 10.667, 11.167) * (1 - prog(t, 12.667, 13.0));
+  rect('rule', 945, 0, 18, H, RED, ruleAlpha);
+  // The morph: a square until 11.0, a superellipse from 11.0 to 12.0, a circle after 12.0
+  if (t < 11) {
+    tile('morph', 2, 7, RED, t, 10.667, 0.4);
+  } else if (t < 12) {
+    const p = prog(t, 11, 12);
+    const cx = lerp(472.5, 405, p), cy = lerp(1147.5, 675, p);   // the circle's centre: cells 1-2, 3-4
+    const half = lerp(58.5, 126, p);                             // half the width
+    const n = lerp(24, 2, p);                                    // 24 = square-ish, 2 = circle
+    path('morph', blob(cx, cy, half, n), RED);
+  } else {
+    // The circle stays through the background change, then fades out before the lockup
+    circle('morph', 405, 675, 126, RED, 1 - prog(t, 12.667, 13.0));
+  }
+  hat('h5', 877.5, 877.5, t, HATS.a5);
+}
+
+/* ===================== ACT 6 (13.333 - 16): LOCKUP ===================== */
+// White field. The whole sentence in three lines, with the caption. Holds, then fades to white.
+function act6(t) {
+  word('l1', 'UNUS PRO', 135, 430, 84, BLACK, t, 13.333, 15.333);
+  word('l2', 'OMNIBUS,', rightX('OMNIBUS,', 136, 945), 640, 136, RED, t, 13.333, 15.333);
+  word('l3', 'OMNES PRO UNO', 135, 850, 84, BLACK, t, 13.333, 15.333);
+  word('cap', '90 BPM — 4/4 — 16 S', 135, 1150, 52, BLACK, t, 13.333, 15.333);
+}
+
+// Draw all six acts for time t. Each act keeps its own timing; nothing is cut.
+function scene(t) {
+  act1(t);
+  act2(t);
+  act3(t);
+  modules(t);
+  act4(t);
+  act5(t);
+  act6(t);
+}
+
+// seek(t): paint frame t on the canvas and return that frame's records.
+let lastT = 0;
+window.seek = function (t) {
+  lastT = wrap(t);
+  return compose(lastT, true);
+};
+
+/* ===================== 5. CANVAS SIZE ===================== */
+// Fit the 1080 x 1350 picture into the window, centred. Canvas pixels are capped at 2x.
+function resize() {
+  const s = Math.min(innerWidth / W, innerHeight / H);
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  canvas.style.width = Math.floor(W * s) + 'px';
+  canvas.style.height = Math.floor(H * s) + 'px';
+  canvas.width = Math.round(W * s * dpr);
+  canvas.height = Math.round(H * s * dpr);
+  ctx.setTransform(canvas.width / W, 0, 0, canvas.height / H, 0, 0);
+}
+
+/* ===================== 6. FRAME CHECK ===================== */
+const TOL = 0.02;         // "exactly" allows 0.02 px of rounding
+
+// Turn a record into a simple outline: 'r' rectangle (text and paths use their box),
+// 'c' circle, 'l' line
+function outlineOf(r) {
+  if (r.kind === 'circle') return { t: 'c', cx: r.cx, cy: r.cy, r: r.r };
+  if (r.kind === 'line') return { t: 'l', x1: r.x1, y1: r.y1, x2: r.x2, y2: r.y2, th: r.th };
+  return { t: 'r', x: r.x, y: r.y, w: r.w, h: r.h };
+}
+
+// A line becomes 101 small circles, each half its thickness, spaced along it
+function linePoints(o) {
+  const pts = [];
+  for (let i = 0; i <= 100; i++) {
+    const u = i / 100;
+    pts.push({ t: 'c', cx: o.x1 + (o.x2 - o.x1) * u, cy: o.y1 + (o.y2 - o.y1) * u, r: o.th / 2 });
+  }
+  return pts;
+}
+
+// Distance from a point to a rectangle (0 if inside)
+function pointRectDist(px, py, R) {
+  const dx = Math.max(R.x - px, 0, px - (R.x + R.w));
+  const dy = Math.max(R.y - py, 0, py - (R.y + R.h));
+  return Math.hypot(dx, dy);
+}
+
+// Gap between two outlines, in frame pixels. Below 0 means they overlap.
+function gapBetween(a, b) {
+  if (a.t === 'l') return Math.min(...linePoints(a).map(p => gapBetween(p, b)));
+  if (b.t === 'l') return gapBetween(b, a);
+  if (a.t === 'c' && b.t === 'r') return pointRectDist(a.cx, a.cy, b) - a.r;
+  if (a.t === 'r' && b.t === 'c') return pointRectDist(b.cx, b.cy, a) - b.r;
+  if (a.t === 'c') return Math.hypot(a.cx - b.cx, a.cy - b.cy) - a.r - b.r;
+  // rectangle to rectangle: the gap along x and along y, combined
+  const gx = Math.max(a.x - (b.x + b.w), b.x - (a.x + a.w), 0);
+  const gy = Math.max(a.y - (b.y + b.h), b.y - (a.y + a.h), 0);
+  return Math.hypot(gx, gy);
+}
+
+// True if v is a whole multiple of step, counted from the margin
+function onStep(v, step) {
+  const r = (((v - M) % step) + step) % step;
+  return r < TOL || step - r < TOL;
+}
+
+// A shape that has stayed still for 6 frames must sit on the grid. Returns a message or null.
+function restProblem(r) {
+  if (r.kind === 'text') {
+    if (!SIZES.includes(r.size)) return `word at size ${r.size}`;
+    if (r.color === RED && r.size < 84) return 'red text below 84';
+    return null;
+  }
+  if (r.kind === 'line') {
+    if (Math.abs(r.y1 - r.y2) < TOL) return onStep(r.y1, HALF) ? null : 'line off the grid';
+    if (Math.abs(r.x1 - r.x2) < TOL) return onStep(r.x1, HALF) ? null : 'line off the grid';
+    return 'diagonal line at rest';
+  }
+  if (r.kind === 'path') return null;                       // a morph in progress is never at rest
+  // Full-width or full-height rule: its edge sits on a grid line or cell centre
+  if (r.w >= W - TOL) return onStep(r.y, HALF) ? null : 'rule off the grid';
+  if (r.h >= H - TOL) return onStep(r.x, HALF) ? null : 'rule off the grid';
+  // Small hi-hat mark: its centre sits on a grid line or cell centre
+  if (r.kind === 'rect' && r.w <= 34 && r.h <= 34) {
+    return onStep(r.x + r.w / 2, HALF) && onStep(r.y + r.h / 2, HALF) ? null : 'mark off the grid';
+  }
+  // Block or circle: its box is whole cells, shrunk by INSET on each side
+  const okX = onStep(r.x - INSET, CELL) && onStep(r.x + r.w + INSET, CELL);
+  const okY = onStep(r.y - INSET, CELL) && onStep(r.y + r.h + INSET, CELL);
+  return okX && okY ? null : 'shape not on the grid';
+}
+
+// Area of an ink record, weighted by its alpha (used for the 30% balance rule)
+function areaOf(r) {
+  return (r.kind === 'circle' ? Math.PI * r.r * r.r : r.w * r.h) * r.alpha;
+}
+function centreX(r) {
+  if (r.kind === 'circle') return r.cx;
+  if (r.kind === 'line') return (r.x1 + r.x2) / 2;
+  return r.x + r.w / 2;
+}
+
+// Walks t from 0 to 16 in steps of 1/60 s and returns every rule break
+function runFrameCheck() {
+  const problems = [];
+  let prevList = null, prevById = null, prevMix = null;
+  let prevRest = new Map();     // id -> how many frames in a row its box has been the same
+  let changeRun = 0;            // how many frames in a row the background has been changing
+
+  for (let k = 0; k <= 960; k++) {
+    const t = k / 60;
+    const list = compose(t, false);
+    const T = Math.round(t * 1000) / 1000;
+    const add = (rule, ids, msg = '') => problems.push({ t: T, rule, ids, msg });
+
+    const bg = list.find(r => r.kind === 'field');
+    const ink = list.filter(r => r.kind !== 'field' && r.alpha > 0.001);
+    const shown = ink.filter(r => r.alpha > 0.05);
+    const byId = new Map(ink.map(r => [r.id, r]));
+    if (byId.size !== ink.length) add('duplicate-id', []);
+
+    // Words: fully inside the live area; OMNIBUS always with its comma
+    for (const r of ink) {
+      if (r.kind !== 'text') continue;
+      if (r.x < LIVE.x - TOL || r.y < LIVE.y - TOL ||
+          r.x + r.w > LIVE.x + LIVE.w + TOL || r.y + r.h > LIVE.y + LIVE.h + TOL)
+        add('word-outside-live-area', [r.id], r.str);
+      if (r.str.includes('OMNIBUS') && !r.str.includes('OMNIBUS,')) add('omnibus-no-comma', [r.id], r.str);
+    }
+
+    // Shapes may touch the frame edge only as a full-width or full-height rule
+    for (const r of ink) {
+      if (r.kind === 'text') continue;
+      const touches = r.x <= TOL || r.y <= TOL || r.x + r.w >= W - TOL || r.y + r.h >= H - TOL;
+      const rule = (r.kind === 'rect' || r.kind === 'line') && (r.w >= W - TOL || r.h >= H - TOL);
+      if (touches && !rule) add('shape-on-frame-edge', [r.id]);
+    }
+
+    // 17 px of empty space between any two things
+    const outl = shown.map(r => ({ r, o: outlineOf(r) }));
+    for (let i = 0; i < outl.length; i++) {
+      for (let j = i + 1; j < outl.length; j++) {
+        const g = gapBetween(outl[i].o, outl[j].o);
+        if (g < 17 - TOL) add('too-close', [outl[i].r.id, outl[j].r.id], `${g.toFixed(1)} px`);
+      }
+    }
+
+    // Resting shapes must sit on the grid (checked once they have stayed still for 6 frames)
+    const nowRest = new Map();
+    for (const r of ink) {
+      const sig = [r.x, r.y, r.w, r.h].map(v => v.toFixed(2)).join(',');
+      const was = prevRest.get(r.id);
+      const count = was && was.sig === sig ? was.count + 1 : 1;
+      nowRest.set(r.id, { sig, count });
+      if (count >= 6) {
+        const msg = restProblem(r);
+        if (msg) add('rest-not-on-grid', [r.id], msg);
+      }
+    }
+    prevRest = nowRest;
+
+    // Speed limit (24 px a frame) and no popping in or out
+    if (prevById) {
+      for (const r of ink) {
+        const p = prevById.get(r.id);
+        if (p) {
+          const d = Math.max(Math.abs(r.x - p.x), Math.abs(r.y - p.y),
+                             Math.abs(r.x + r.w - (p.x + p.w)), Math.abs(r.y + r.h - (p.y + p.h)));
+          if (d > 24 + TOL) add('too-fast', [r.id], `${d.toFixed(1)} px`);
+        } else if (r.alpha > 0.25 && r.w > 17 && r.h > 17) {
+          add('pops-in', [r.id]);
+        }
+      }
+      for (const p of prevList) {
+        if (!byId.has(p.id) && p.alpha > 0.25 && p.w > 17 && p.h > 17) add('pops-out', [p.id]);
+      }
+    }
+
+    // Background: at most 5% a frame; each change lasts 40 frames or more; no words while it changes
+    const mix = bg.mix;
+    if (prevMix !== null) {
+      const d = Math.abs(mix - prevMix);
+      if (d > 0.05 + 1e-9) add('bg-too-fast', [], `${(d * 100).toFixed(1)}%`);
+      if (d > 1e-9) {
+        changeRun++;
+        const words = ink.filter(r => r.kind === 'text').map(r => r.id);
+        if (words.length) add('word-during-bg-change', words);
+      } else {
+        if (changeRun > 0 && changeRun < 40) add('bg-change-short', [], `${changeRun} frames`);
+        changeRun = 0;
+      }
+    }
+    prevMix = mix;
+
+    // At most 200 shapes in one frame
+    if (ink.length > 200) add('over-200-shapes', [], `${ink.length}`);
+
+    // At each beat: at least 30% of the ink on each side (plain white frames skipped)
+    if (ink.length && Math.abs(t * 1.5 - Math.round(t * 1.5)) < 1e-6) {
+      let total = 0, left = 0, right = 0;
+      for (const r of ink) {
+        const a = areaOf(r);
+        total += a;
+        if (centreX(r) < W / 2) left += a; else right += a;
+      }
+      if (total > 0 && (left < 0.3 * total || right < 0.3 * total))
+        add('balance', [], `left ${Math.round(100 * left / total)}%`);
+    }
+
+    prevList = ink;
+    prevById = byId;
+  }
+  return problems;
+}
+
+// The last full check, kept so key F can colour outlines
+let lastProblems = [];
+window.frameCheck = function () {
+  lastProblems = runFrameCheck();
+  const counts = {};
+  for (const p of lastProblems) counts[p.rule] = (counts[p.rule] || 0) + 1;
+  console.log('frameCheck:', lastProblems.length, 'problems', counts);
+  return lastProblems;
+};
+
+/* ===================== 7. PLAYBACK: CLOCK, KEYS, BUTTONS, OVERLAYS ===================== */
+let playing = true;      // true = the clock runs; false = the frame at clockT stays on screen
+let clockT = 0;          // the frozen time while paused
+let startWall = 0;       // the clock's start in seconds; time = now - startWall, looped to 16
+let showD = false, metro = false, showF = false;
+let audio = null;        // Web Audio, made on the first M press (browsers need a tap first)
+let barUntil = 0;        // the tap button row stays visible until this time (ms)
+let prevT = null;        // last frame's time, for the metronome
+let lastNow = null;      // last frame's time in ms, for the frame timing
+let timing = null;       // an open 10 s measurement, or null
+const bar = document.getElementById('bar');
+const btn = id => document.getElementById(id);
+
+// Every click the metronome plays: 24 beats (kick, snare, soft kick, snare) plus all hi-hat hits
+const EVENTS = [];
+for (let k = 0; k < 24; k++) {
+  EVENTS.push({ t: k * BEAT, kind: k % 2 === 0 ? 'kick' : 'snare', gain: k % 4 === 2 ? 0.35 : 0.8 });
+}
+for (const list of Object.values(HATS)) for (const t of list) EVENTS.push({ t, kind: 'hat', gain: 0.5 });
+
+// Current time in the loop
+function nowT() { return playing ? wrap(performance.now() / 1000 - startWall) : clockT; }
+
+// Start or stop the clock. Stopping keeps the frame on screen.
+function play(on) {
+  if (on === playing) return;
+  if (on) startWall = performance.now() / 1000 - clockT;
+  else clockT = nowT();
+  playing = on;
+  btn('b-play').textContent = playing ? 'Pause' : 'Play';
+}
+
+// Jump the clock to time t (works while playing and while paused)
+function seekTo(t) {
+  clockT = wrap(t);
+  if (playing) startWall = performance.now() / 1000 - clockT;
+}
+
+// Move one beat forward (dir = 1) or back (dir = -1); the clock wraps after 24 beats
+function stepBeat(dir) {
+  const beat = Math.round(nowT() * 1.5);     // 1.5 beats per second at 90 BPM
+  seekTo((((beat + dir) % 24) + 24) % 24 * BEAT);
+}
+
+// Hits between the last frame's time a and this frame's time b. Handles the wrap at 16.
+function eventsBetween(a, b) {
+  let d = b - a;
+  if (d < -LOOP / 2) d += LOOP;              // went past 16 and back to 0
+  if (d > LOOP / 2) d -= LOOP;
+  if (d <= 0 || d > 0.5) return [];          // standing still, or a jump (a beat button): no clicks
+  return EVENTS.filter(e => { const x = ((e.t - a) % LOOP + LOOP) % LOOP; return x > 0 && x <= d; });
+}
+
+// Web Audio is made (or woken) inside a tap, as browsers require
+function ensureAudio() {
+  try {
+    if (!audio) audio = new (window.AudioContext || window.webkitAudioContext)();
+    if (audio.state === 'suspended') audio.resume();
+  } catch (e) { audio = null; }
+}
+
+// A short synthetic drum sound: kick (sine falling in pitch), snare (triangle), hi-hat (short square tick)
+function blip(kind, gain) {
+  if (!audio) return;
+  const now = audio.currentTime;
+  const o = audio.createOscillator(), g = audio.createGain();
+  if (kind === 'kick') {
+    o.type = 'sine';
+    o.frequency.setValueAtTime(140, now);
+    o.frequency.exponentialRampToValueAtTime(45, now + 0.12);
+    g.gain.setValueAtTime(gain, now);
+    g.gain.exponentialRampToValueAtTime(0.001, now + 0.25);
+  } else if (kind === 'snare') {
+    o.type = 'triangle';
+    o.frequency.setValueAtTime(190, now);
+    g.gain.setValueAtTime(gain * 0.5, now);
+    g.gain.exponentialRampToValueAtTime(0.001, now + 0.12);
+  } else {
+    o.type = 'square';
+    o.frequency.setValueAtTime(6000, now);
+    g.gain.setValueAtTime(gain * 0.15, now);
+    g.gain.exponentialRampToValueAtTime(0.001, now + 0.03);
+  }
+  o.connect(g);
+  g.connect(audio.destination);
+  o.start(now);
+  o.stop(now + 0.3);
+}
+
+// Draw a red outline around every recorded shape: green if fine, red if it breaks a rule at this time
+function drawOutlines(list, t) {
+  const bad = new Set();
+  for (const p of lastProblems) {
+    if (Math.abs(p.t - t) < 0.009) for (const id of p.ids) bad.add(id);
+  }
+  ctx.save();
+  ctx.globalAlpha = 1;
+  ctx.lineWidth = 2;
+  for (const r of list) {
+    if (r.kind === 'field') continue;
+    ctx.strokeStyle = bad.has(r.id) ? '#ff0000' : '#00aa00';
+    ctx.beginPath();
+    if (r.kind === 'circle') ctx.arc(r.cx, r.cy, r.r, 0, Math.PI * 2);
+    else ctx.rect(r.x, r.y, r.w, r.h);       // rectangles, words, lines and paths: their box
+    ctx.stroke();
+  }
+  ctx.restore();
+}
+
+// The D overlay: bar.beat in the top-left corner (an HTML label, not part of the picture)
+const hud = document.createElement('div');
+hud.style.cssText = 'position:fixed;left:8px;top:8px;padding:2px 6px;background:rgba(0,0,0,.6);' +
+  'color:#fff;font:700 14px monospace;pointer-events:none;display:none;z-index:5';
+document.body.appendChild(hud);
+
+function updateHud(t) {
+  if (!showD) return;
+  const beatIndex = Math.floor(t * 1.5 + 1e-6);   // 0..23
+  hud.textContent = `${Math.floor(beatIndex / 4) + 1}.${(beatIndex % 4) + 1}`;
+}
+
+// Button toggles (each also keeps the tap row open)
+function setOn(id, on) {
+  const b = btn(id);
+  b.style.background = on ? '#ffffff' : '#111111';
+  b.style.color = on ? '#111111' : '#ffffff';
+}
+function toggleD() { showD = !showD; hud.style.display = showD ? 'block' : 'none'; setOn('b-d', showD); }
+function toggleM() {
+  metro = !metro;
+  if (metro) ensureAudio();
+  setOn('b-m', metro);
+}
+function toggleF() {
+  showF = !showF;
+  if (showF) window.frameCheck();          // run the check once so the outlines can be coloured
+  setOn('b-f', showF);
+}
+
+// Tap the picture (or press a button): the tap row shows for 3 s, then fades over the last 0.4 s
+function showBar() { barUntil = performance.now() + 3000; }
+function updateBar(now) {
+  const a = clamp01((barUntil - now) / 400);
+  bar.style.opacity = a;
+  bar.style.pointerEvents = a > 0.01 ? 'auto' : 'none';
+}
+
+// Start a frame-timing run: records each frame gap and each seek() time while playing
+function startTiming(seconds = 10) {
+  timing = { until: performance.now() + seconds * 1000, gaps: [], seeks: [] };
+}
+function finishTiming() {
+  const avg = a => a.reduce((x, y) => x + y, 0) / a.length;
+  const g = timing.gaps, s = timing.seeks;
+  const stats = {
+    frames: g.length,
+    avgFrameMs: +avg(g).toFixed(2),
+    worstFrameMs: +Math.max(...g).toFixed(2),
+    framesOver20ms: g.filter(x => x > 20).length,
+    avgSeekMs: +avg(s).toFixed(3),
+    worstSeekMs: +Math.max(...s).toFixed(3)
+  };
+  window.lastTiming = stats;
+  console.log('timing', stats);
+  timing = null;
+}
+
+// The main loop: one seek() per animation frame, driven by the clock
+function loop() {
+  const now = performance.now();
+  const t = nowT();
+
+  const s0 = performance.now();
+  const list = seek(t);                    // paints frame t and returns its records
+  const s1 = performance.now();
+  if (showF) drawOutlines(list, t);
+
+  if (metro) for (const e of eventsBetween(prevT === null ? t : prevT, t)) blip(e.kind, e.gain);
+  prevT = t;
+
+  if (timing && playing && lastNow !== null && now < timing.until) {
+    timing.gaps.push(now - lastNow);
+    timing.seeks.push(s1 - s0);
+  } else if (timing && now >= timing.until) {
+    finishTiming();
+  }
+  lastNow = now;
+
+  updateBar(now);
+  updateHud(t);
+  requestAnimationFrame(loop);
+}
+
+// Keys (for a laptop): Space, arrows, D, M, F, and T for a 10 s timing run
+window.addEventListener('keydown', e => {
+  if (e.code === 'Space') { e.preventDefault(); play(!playing); }
+  else if (e.code === 'ArrowRight') stepBeat(1);
+  else if (e.code === 'ArrowLeft') stepBeat(-1);
+  else if (e.key === 'd' || e.key === 'D') toggleD();
+  else if (e.key === 'm' || e.key === 'M') toggleM();
+  else if (e.key === 'f' || e.key === 'F') toggleF();
+  else if (e.key === 't' || e.key === 'T') startTiming(10);
+});
+
+// Buttons for phones (each one is at least 44 px tall) and a tap on the picture shows them
+btn('b-play').addEventListener('click', () => { play(!playing); showBar(); });
+btn('b-prev').addEventListener('click', () => { stepBeat(-1); showBar(); });
+btn('b-next').addEventListener('click', () => { stepBeat(1); showBar(); });
+btn('b-d').addEventListener('click', () => { toggleD(); showBar(); });
+btn('b-m').addEventListener('click', () => { toggleM(); showBar(); });
+btn('b-f').addEventListener('click', () => { toggleF(); showBar(); });
+document.getElementById('c').addEventListener('click', showBar);
+
+/* ===================== START-UP ===================== */
+canvas = document.getElementById('c');
+ctx = canvas.getContext('2d');
+resize();
+window.addEventListener('resize', resize);
+startWall = performance.now() / 1000;      // the clock starts at t = 0
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
