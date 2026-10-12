@@ -39,7 +39,7 @@
   <button id="reveal">Reveal</button>
 </header>
 
-<!-- Row 1: the first round. Row 2: the second round. Row 3: the third round. Row 4: the fourth round. All are filled in by the script below. -->
+<!-- Row 1: the first round. Row 2: the second round. Row 3: the third round. Row 4: the fourth round. Row 5: the fifth round. All are filled in by the script below. -->
 <h2>Round 1 – Swiss Grid</h2>
 <div class="gallery" id="gallery1"></div>
 
@@ -51,6 +51,9 @@
 
 <h2>Round 4 – Unus</h2>
 <div class="gallery" id="gallery4"></div>
+
+<h2>Round 5 – Unus Smooth</h2>
+<div class="gallery" id="gallery5"></div>
 
 <script>
   // Round 1: the four setups = the four folder names inside pieces/swiss-grid/.
@@ -82,6 +85,13 @@
 
   // Round 4: three setups, fixed order (no shuffling), labelled with their folder names.
   var unusVersions = [
+    { label: "opus-high",   folder: "opus-high" },
+    { label: "sonnet-high", folder: "sonnet-high" },
+    { label: "haiku-high",  folder: "haiku-high" }
+  ];
+
+  // Round 5: three setups, fixed order (no shuffling), labelled with their folder names.
+  var unusSmoothVersions = [
     { label: "opus-high",   folder: "opus-high" },
     { label: "sonnet-high", folder: "sonnet-high" },
     { label: "haiku-high",  folder: "haiku-high" }
@@ -144,6 +154,7 @@
   buildRow("gallery2", "swiss-hero", heroVersions, false);
   buildRow("gallery3", "swiss-machine", machineVersions, false);
   buildRow("gallery4", "unus", unusVersions, false);
+  buildRow("gallery5", "unus-smooth", unusSmoothVersions, false);
 
   // The Reveal button (Round 1 only) toggles between "A" and "A: Team".
   document.getElementById("reveal").addEventListener("click", function () {
