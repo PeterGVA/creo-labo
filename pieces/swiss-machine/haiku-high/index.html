@@ -1,0 +1,839 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<title>Swiss Machine</title>
+<style>
+  /* Black page, poster centred. No text in the HTML: every letter is drawn on canvas. */
+  html, body { margin: 0; height: 100%; background: #000000; overflow: hidden; }
+  #stage { position: fixed; left: 50%; top: 50%; transform: translate(-50%, -50%); }
+  #stage canvas { position: absolute; left: 0; top: 0; display: block; }
+  #gl { display: none; }
+  #ov { pointer-events: none; }
+</style>
+</head>
+<body>
+<div id="stage">
+  <canvas id="out"></canvas>   <!-- clean composite (plain 2D canvas) -->
+  <canvas id="gl"></canvas>    <!-- print finish (WebGL2), shown when F is on -->
+  <canvas id="ov"></canvas>    <!-- overlays: D = beat readout, C = critic checklist -->
+</div>
+<script>
+"use strict";
+
+/* ==== 1. CONSTANTS ==== */
+const W = 1080, H = 1350;                              // poster size in logical pixels
+const M = 135;                                         // margin, and also one grid cell
+const LIVE = { x0: M, y0: M, x1: W - M, y1: H - M };   // the area inside the margins
+const CAPS = [17, 34, 68, 135, 270, 540, 1080];        // the only cap heights allowed
+const RULE_T = [2, 4, 8, 17, 34];                      // the only rule thicknesses allowed
+const COL = { black: '#111111', red: '#e30613', white: '#ffffff' };
+const LOOP = 16, PRE = 0.12;                           // loop length (s); a move starts this early before its beat
+const BOX = 0.66;                                      // letter box width at normal width, as a share of cap height
+const GAP = 0.14;                                      // space between letters, as a share of cap height
+const NP = 40;                                         // points per stroke when a letter is resampled for morphing
+const ROWS = [135, 270, 405, 540, 675, 810, 945, 1080, 1215]; // baselines that sit on the grid
+
+/* ==== 2. THE TYPEFACE ====
+   Every letter is a list of strokes. A stroke is a list of points [x, y] on a
+   unit box: x runs 0 (left) to 1 (right); y runs 0 (baseline) to 1 (cap height).
+   All letters use the same few corner points, so they share parts and can morph.
+   Curves are replaced by straight chamfers (cut corners): that keeps the set small. */
+const O_STROKE = [[.18,0],[.82,0],[1,.18],[1,.82],[.82,1],[.18,1],[0,.82],[0,.18],[.18,0]];
+const GL = {
+  A: [[[0,0],[.5,1],[1,0]], [[.2,.42],[.8,.42]]],
+  B: [[[0,0],[0,1],[.7,1],[.85,.85],[.85,.65],[.7,.5],[0,.5]], [[.7,.5],[.9,.4],[.9,.1],[.7,0],[0,0]]],
+  C: [[[1,.82],[.82,1],[.18,1],[0,.82],[0,.18],[.18,0],[.82,0],[1,.18]]],
+  D: [[[0,0],[0,1],[.6,1],[1,.75],[1,.25],[.6,0],[0,0]]],
+  E: [[[1,1],[0,1],[0,0],[1,0]], [[0,.5],[.75,.5]]],
+  F: [[[1,1],[0,1],[0,0]], [[0,.5],[.75,.5]]],
+  G: [[[1,.82],[.82,1],[.18,1],[0,.82],[0,.18],[.18,0],[.82,0],[1,.18],[1,.5],[.55,.5]]],
+  H: [[[0,0],[0,1]], [[1,0],[1,1]], [[0,.5],[1,.5]]],
+  I: [[[.5,0],[.5,1]]],
+  J: [[[1,1],[1,.18],[.82,0],[.18,0],[0,.18],[0,.35]]],
+  K: [[[0,0],[0,1]], [[1,1],[0,.5],[1,0]]],
+  L: [[[0,1],[0,0],[1,0]]],
+  M: [[[0,0],[0,1],[.5,.5],[1,1],[1,0]]],
+  N: [[[0,0],[0,1],[1,0],[1,1]]],
+  O: [O_STROKE],
+  P: [[[0,0],[0,1],[.8,1],[1,.85],[1,.65],[.8,.5],[0,.5]]],
+  Q: [O_STROKE, [[.6,.35],[1,0]]],
+  R: [[[0,0],[0,1],[.8,1],[1,.85],[1,.65],[.8,.5],[0,.5]], [[.45,.5],[1,0]]],
+  S: [[[1,.82],[.82,1],[.18,1],[0,.82],[0,.65],[.18,.5],[.82,.5],[1,.35],[1,.18],[.82,0],[.18,0],[0,.18]]],
+  T: [[[0,1],[1,1]], [[.5,1],[.5,0]]],
+  U: [[[0,1],[0,.18],[.18,0],[.82,0],[1,.18],[1,1]]],
+  V: [[[0,1],[.5,0],[1,1]]],
+  W: [[[0,1],[.25,0],[.5,.6],[.75,0],[1,1]]],
+  X: [[[0,0],[1,1]], [[0,1],[1,0]]],
+  Y: [[[0,1],[.5,.5],[1,1]], [[.5,.5],[.5,0]]],
+  Z: [[[0,1],[1,1],[0,0],[1,0]]],
+  '0': [O_STROKE, [[.25,.2],[.75,.8]]],
+  '1': [[[.2,.8],[.6,1],[.6,0]], [[.2,0],[1,0]]],
+  '2': [[[0,.82],[.18,1],[.82,1],[1,.82],[1,.6],[0,.4],[0,0],[1,0]]],
+  '3': [[[0,.82],[.18,1],[.82,1],[1,.82],[1,.65],[.82,.5],[.3,.5]], [[.82,.5],[1,.35],[1,.18],[.82,0],[.18,0],[0,.18]]],
+  '4': [[[.75,0],[.75,1],[0,.35],[1,.35]]],
+  '5': [[[1,1],[0,1],[0,.5],[.82,.5],[1,.35],[1,.18],[.82,0],[.18,0],[0,.18]]],
+  '6': [[[1,.82],[.82,1],[.18,1],[0,.82],[0,.18],[.18,0],[.82,0],[1,.18],[1,.35],[.82,.5],[0,.5]]],
+  '7': [[[0,1],[1,1],[.4,0]]],
+  '8': [[[.18,.5],[0,.66],[0,.84],[.18,1],[.82,1],[1,.84],[1,.66],[.82,.5],[.18,.5],[0,.34],[0,.16],[.18,0],[.82,0],[1,.16],[1,.34],[.82,.5]]],
+  '9': [[[1,.5],[0,.5],[0,.82],[.18,1],[.82,1],[1,.82],[1,0],[.18,0]]],
+  '-': [[[.15,.5],[.85,.5]]],
+  '/': [[[.1,0],[.9,1]]],
+  '.': [[[.3,0],[.7,0],[.7,.3],[.3,.3],[.3,0]]],
+  ':': [[[.3,0],[.7,0],[.7,.3],[.3,.3],[.3,0]], [[.3,.7],[.7,.7],[.7,1],[.3,1],[.3,.7]]],
+  ' ': [],
+};
+const MAXS = Math.max(...Object.values(GL).map(s => s.length));  // most strokes any letter has
+
+// Distance from one letter to the next, and the total width of a string.
+const adv = (cap, sx) => cap * (BOX * sx + GAP);
+function textWidth(str, cap, sx) {
+  const n = [...str].length;
+  return n === 0 ? 0 : n * adv(cap, sx) - cap * GAP;
+}
+
+// Line thickness: hairline (2 px) at wgt 0, ultra heavy (21% of cap height) at wgt 1.
+function lineW(cap, wgt) { return 2 + (cap * 0.21 - 2) * wgt; }
+
+// Turn a letter's unit points into page pixels and stroke them.
+function strokePath(ctx, strokes, x, base, cap, sx) {
+  ctx.beginPath();
+  for (const stroke of strokes) {
+    stroke.forEach((p, i) => {
+      const px = x + p[0] * cap * BOX * sx;   // unit x scaled by the letter box width
+      const py = base - p[1] * cap;           // unit y: 0 = baseline, 1 = cap height
+      if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+    });
+  }
+  ctx.stroke();
+}
+
+// Draw a string, letter by letter, starting at x on the baseline `base`.
+function drawWord(ctx, str, x, base, cap, sx, wgt, col) {
+  ctx.strokeStyle = col;
+  ctx.lineWidth = lineW(cap, wgt);
+  ctx.lineCap = 'butt';
+  ctx.lineJoin = 'miter';
+  ctx.miterLimit = 8;
+  let cx = x;
+  for (const ch of str) {
+    if (GL[ch]) strokePath(ctx, GL[ch], cx, base, cap, sx);
+    cx += adv(cap, sx);
+  }
+}
+
+// Morphing needs every letter as the same number of points.
+// Cut each stroke into NP points spaced evenly along its length.
+function resampleStroke(pts, n) {
+  const d = [0];                                   // distance along the stroke at each point
+  for (let i = 1; i < pts.length; i++)
+    d.push(d[i - 1] + Math.hypot(pts[i][0] - pts[i - 1][0], pts[i][1] - pts[i - 1][1]));
+  const total = d[d.length - 1];
+  const out = [];
+  let seg = 0;
+  for (let k = 0; k < n; k++) {
+    if (total === 0) { out.push([pts[0][0], pts[0][1]]); continue; }
+    const target = total * k / (n - 1);
+    while (seg < pts.length - 2 && d[seg + 1] < target) seg++;
+    const span = d[seg + 1] - d[seg] || 1;
+    const u = (target - d[seg]) / span;
+    out.push([pts[seg][0] + (pts[seg + 1][0] - pts[seg][0]) * u,
+              pts[seg][1] + (pts[seg + 1][1] - pts[seg][1]) * u]);
+  }
+  return out;
+}
+
+// The resampled skeleton of a letter, with empty strokes padded out (they draw nothing).
+const SKEL = {};
+function skel(ch) {
+  if (SKEL[ch]) return SKEL[ch];
+  const strokes = GL[ch];
+  const out = [];
+  for (let s = 0; s < MAXS; s++)
+    out.push(s < strokes.length ? resampleStroke(strokes[s], NP)
+                                : Array.from({ length: NP }, () => [0.5, 0.5]));
+  return (SKEL[ch] = out);
+}
+
+// Draw the letter halfway (or any amount m from 0 to 1) between chA and chB.
+function drawMorph(ctx, chA, chB, m, x, base, cap, sx, wgt, col) {
+  const A = skel(chA), B = skel(chB);
+  const strokes = A.map((sa, s) => sa.map((p, i) => [
+    p[0] + (B[s][i][0] - p[0]) * m,
+    p[1] + (B[s][i][1] - p[1]) * m,
+  ]));
+  ctx.strokeStyle = col;
+  ctx.lineWidth = lineW(cap, wgt);
+  ctx.lineCap = 'butt';
+  ctx.lineJoin = 'miter';
+  strokePath(ctx, strokes, x, base, cap, sx);
+}
+
+// Motion blur for a morph: draw the same letter at a few earlier moments, faintly.
+function drawMorphBlur(ctx, it) {
+  for (const s of it.mor) {
+    ctx.globalAlpha = s.a;
+    drawMorph(ctx, it.str, it.morphTo, s.m, it.x, it.base, it.cap, it.sx, it.wgt, it.col);
+  }
+  ctx.globalAlpha = 1;
+}
+
+// n points spread along a letter's strokes (used by the swarm).
+function sampleLetter(ch, x, base, cap, sx, n) {
+  const pts = [];
+  for (const s of GL[ch]) for (const p of resampleStroke(s, 60)) pts.push(p);
+  const out = new Float32Array(2 * n);
+  for (let i = 0; i < n; i++) {
+    const p = pts[Math.floor(i * pts.length / n)];
+    out[2 * i] = x + p[0] * cap * BOX * sx;
+    out[2 * i + 1] = base - p[1] * cap;
+  }
+  return out;
+}
+
+/* ==== 3. THE DESIGN MACHINE: seeded random, edition plan, critic ==== */
+// mulberry32: a small seeded random generator. Same seed, same numbers, every time.
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = a + 0x6D2B79F5 | 0;
+    let t = Math.imul(a ^ a >>> 15, 1 | a);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+// Mix two numbers into one seed (used for edition number + retry number).
+function hash2(a, b) {
+  let h = Math.imul(a ^ 0x9E3779B9, 0x85EBCA6B) ^ Math.imul(b + 0x7F4A7C15, 0xC2B2AE35);
+  h ^= h >>> 15; h = Math.imul(h, 0x2C1B3C6D); h ^= h >>> 12;
+  return h >>> 0;
+}
+const h01 = (i, salt) => hash2(i, salt) / 4294967296;   // a fixed number from 0 to 1 per (i, salt)
+const clamp = (v, lo = 0, hi = 1) => Math.min(hi, Math.max(lo, v));
+const lerp = (a, b, t) => a + (b - a) * t;
+const ease = t => (t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2);   // ease in and out
+
+// The three words in German, French and Italian. Each row is one concept.
+const SETS = [
+  ['PROGRAMM', 'PROGRAMME', 'PROGRAMMA'],
+  ['RASTER', 'TRAME', 'GRIGLIA'],
+  ['FORM', 'FORME', 'FORMA'],
+  ['ZEIT', 'TEMPS', 'TEMPO'],
+  ['RHYTHMUS', 'RYTHME', 'RITMO'],
+  ['PUNKT', 'POINT', 'PUNTO'],
+];
+
+// Make the plan (the sizes, places and words) for edition n, retry number sub.
+function makePlan(n, sub) {
+  const R = mulberry32(hash2(n, sub));
+  const pick = arr => arr[Math.floor(R() * arr.length)];
+  const lang = n === 1 ? 0 : Math.floor(R() * 3);         // 0 German, 1 French, 2 Italian
+  const order = [0, 1, 2, 3, 4, 5];
+  if (n !== 1) for (let i = 5; i > 0; i--) {              // shuffle (edition 1 keeps its order)
+    const j = Math.floor(R() * (i + 1));
+    [order[i], order[j]] = [order[j], order[i]];
+  }
+  const words = order.slice(0, 3).map(c => SETS[c][lang]);
+  const alignX = n === 1 ? 270 : pick([270, 405]);       // the one vertical axis (grid line 1 or 2)
+  const m = 3 + Math.floor(R() * 4);
+  const grid = {
+    a: 1 + Math.floor(R() * 3), b: 1 + Math.floor(R() * 3), m,
+    k: 1 + Math.floor(R() * (m - 1)), red: Math.floor(R() * 48),
+  };
+  const morphCaps = n === 1 ? [1080, 540, 1080, 540]
+    : pick([[1080, 540, 1080, 540], [540, 1080, 540, 1080], [1080, 1080, 540, 540]]);
+  const depth = {
+    c1: pick([540, 1080]), b1: pick([675, 810, 945, 1080, 1215, 1674]),
+    c2: pick([68, 135]), b2: pick(ROWS), b3: pick(ROWS),
+  };
+  return {
+    n, sub, words, alignX, grid, morphCaps, depth,
+    morphSx: Math.min(1, (LIVE.x1 - alignX) / (BOX * 1080)),   // widest the big letters can be
+    caption: 'EDITION ' + String(n).padStart(4, '0') + ' / 90 BPM / 4/4 / 16 S',
+  };
+}
+
+// Is grid cell (c, r) filled? An arithmetic rule: (a*c + b*r) mod m < k.
+function filled(P, c, r) {
+  const g = P.grid;
+  return ((g.a * c + g.b * r) % g.m) < g.k;
+}
+// Which beat (1, 2 or 3) a filled cell appears on. Beat 4 shows everything left.
+function cellStage(P, c, r) {
+  const g = P.grid, v = (g.a * c + g.b * r) % g.m;
+  const thr1 = Math.ceil(g.k / 3), thr2 = Math.ceil(2 * g.k / 3);
+  return v < thr1 ? 1 : v < thr2 ? 2 : 3;
+}
+
+// The widest setting (sx) at which a string still fits in maxW pixels.
+function fitSx(str, cap, maxW) {
+  const n = [...str].length;
+  const sx = ((maxW - 0.01 + cap * GAP) / (n * cap) - GAP) / BOX;   // 0.01 px spare, so rounding never crosses the margin
+  return clamp(sx, 0.4, 1.45);
+}
+
+// Edge rule: inside the live area is fine (touching the margin counts as inside).
+// Past the margin is only fine if the frame crops at least 25% of the element.
+function edgeOK(b) {
+  const w = b.x1 - b.x0, h = b.y1 - b.y0;
+  const side = (past, cropped, size) => past <= 0 || cropped >= 0.25 * size;
+  return side(LIVE.x0 - b.x0, Math.max(0, -b.x0), w)
+      && side(b.x1 - LIVE.x1, Math.max(0, b.x1 - W), w)
+      && side(LIVE.y0 - b.y0, Math.max(0, -b.y0), h)
+      && side(b.y1 - LIVE.y1, Math.max(0, b.y1 - H), h);
+}
+
+// The critic: checks a plan against the RULES. Returns a list of failures (empty = pass).
+// It reads the same item geometry the drawing uses, sampled at a resting moment in each beat.
+function critique(P) {
+  const fails = [];
+  const bad = msg => fails.push(msg);
+  // GRID: no plain checkerboard, and the fill must read as an order
+  let isChecker = true, isInverse = true, count = 0;
+  for (let r = 0; r < 8; r++) for (let c = 0; c < 6; c++) {
+    const f = filled(P, c, r), cb = (c + r) % 2 === 0;
+    if (f) count++;
+    if (f !== cb) isChecker = false;
+    if (f === cb) isInverse = false;
+  }
+  if (isChecker || isInverse) bad('GRID IS A CHECKERBOARD');
+  if (count < 10 || count > 38) bad('GRID FILL TOO THIN OR TOO FULL');
+  for (let a = 0; a < 6; a++) for (let j = 0; j < 4; j++) {
+    if (a === 5 && j === 3) continue;                    // last beat is the white cut
+    const t = (4 * a + j) / 1.5 + 0.4;                   // resting moment, before the next pre-move
+    const b = beatAt(t);
+    const items = actItems(P, a, b, t);
+    const tag = 'ACT ' + (a + 1) + ' BEAT ' + (j + 1) + ': ';
+    let big = false, small = false;
+    for (const it of items) {
+      if (it.kind === 'text') {
+        if (!CAPS.includes(it.cap)) bad(tag + 'SIZE OFF THE LADDER');
+        if (it.x !== P.alignX) bad(tag + 'AXIS BROKEN');
+        if (![...it.str].every(ch => GL[ch] !== undefined)) bad(tag + 'TYPE MISSING A GLYPH');
+        if (Math.min(Math.abs(it.wgt), Math.abs(it.wgt - 1)) > 0.01) bad(tag + 'WEIGHT RESTS MID-WAY');
+        if (!edgeOK(it.bbox)) bad(tag + 'EDGE TOUCHES MARGIN');
+        if (it.cap >= 540) big = true;
+        if (it.cap <= 34) small = true;
+      } else if (it.kind === 'particles') {
+        if (it.cap >= 540) big = true;
+        if (!edgeOK(it.bbox)) bad(tag + 'EDGE TOUCHES MARGIN');
+      } else {                                           // rules and filled cells
+        if (it.kind === 'rule' && !RULE_T.includes(it.t)) bad(tag + 'RULE THICKNESS OFF');
+        if (!edgeOK(it.bbox)) bad(tag + 'EDGE TOUCHES MARGIN');
+      }
+      if (!Object.values(COL).includes(it.col)) bad(tag + 'COLOUR OFF PALETTE');
+    }
+    if (!(big && small)) bad(tag + 'NO 540 AGAINST 34');
+  }
+  return fails;
+}
+
+// Build edition n: try retry 0, 1, 2 ... until the critic passes. Keep the record of the first try.
+function buildEdition(n) {
+  let sub = 0, firstTry = null, P, fails;
+  for (;;) {
+    P = makePlan(n, sub);
+    fails = critique(P);
+    if (firstTry === null) firstTry = fails.length === 0;
+    if (fails.length === 0 || sub >= 200) break;
+    sub++;
+  }
+  P.sub = sub; P.firstTry = firstTry; P.fails = fails;
+  return P;
+}
+
+/* ==== 4. TIME ==== */
+// How far a move has got on its way to the next beat (0 to 1, eased).
+// A move starts PRE seconds before its beat and lands exactly on it.
+function moveAt(tt) {
+  const k = Math.floor(tt * 1.5 + 1e-9);          // beat index (1.5 beats per second)
+  const nextT = (k + 1) / 1.5;
+  return ease(clamp((tt - (nextT - PRE)) / PRE));
+}
+// Where we are at time t: which beat, which act, and the spring state after landing.
+function beatAt(t) {
+  const k = Math.floor(t * 1.5 + 1e-9);
+  const tau = t - k / 1.5;                        // seconds since this beat landed
+  return {
+    k, act: Math.floor(k / 4), j: k % 4,          // j = beat within the act, 0 to 3
+    m: moveAt(t),
+    over: 0.12 * Math.exp(-14 * tau) * Math.sin(30 * tau),   // damped spring overshoot
+  };
+}
+// The value of a property on beat j, given a list of beat values (one per beat of the act).
+// Between beats it eases toward the next value; after landing it overshoots once and settles.
+function drive(arr, b) {
+  const S = j => arr[clamp(j, 0, arr.length - 1)];
+  const a = S(b.j), n = S(b.j + 1), p = S(b.j - 1);
+  return a + (n - a) * b.m + (a - p) * b.over;
+}
+
+/* ==== 5. THE SIX ACTS: geometry of each beat ====
+   Each act returns a list of items: text, rules, filled cells, or the particle swarm.
+   Items hold their REST geometry (what the critic checks) plus optional motion
+   (grp = group transform, dx = parallax shift, morph = letter-to-letter blend). */
+const DIAL_W = [0, 1, 0, 1];     // weight on each beat: hairline, heavy, hairline, heavy
+const DIAL_X = [0, 1, 1, 0];     // width on each beat: narrow, wide, wide, narrow
+const SWING = [0, 0, 90, 0];     // degrees: the type block swings to edge-on on beat 3
+const PUSH = [0, 1 / 3, 2 / 3, 1];  // lockup push, one step per beat
+const PERSP = 1800;              // focal length of the fake 3D perspective
+const NEXT_SW = [1, 2, 3, 3];    // swarm: the shape each beat moves toward
+
+// Item builders: each one returns a plain object describing a piece to draw.
+function txt(str, x, base, cap, sx, wgt, col, from, layer) {
+  return { kind: 'text', str, x, base, cap, sx, wgt, col, from, layer,
+    bbox: { x0: x, y0: base - cap, x1: x + textWidth(str, cap, sx), y1: base } };
+}
+function hrule(x0, x1, y, t, col, from, layer) {
+  return { kind: 'rule', t, col, from, layer, bbox: { x0, y0: y - t / 2, x1, y1: y + t / 2 } };
+}
+function vrule(x, y0, y1, t, col, from, layer) {
+  return { kind: 'rule', t, col, from, layer, bbox: { x0: x - t / 2, y0, x1: x + t / 2, y1 } };
+}
+function box(x0, y0, x1, y1, col, from, layer) {
+  return { kind: 'rect', col, from, layer, bbox: { x0, y0, x1, y1 } };
+}
+
+// ACT 1 GRID: the grid draws in on beat 1, cells fill on beats 2 to 4.
+function items1(P, t, b) {
+  const grow = b.j === 0 ? ease(clamp((t - 0.25) / 0.42)) : 1;   // draws in, lands late at t=0
+  const lines = [];
+  for (let c = 1; c < 6; c++) lines.push(vrule(M + c * 135, M, H - M, 2, COL.black, 0, 'back'));
+  for (let r = 1; r < 8; r++) lines.push(hrule(M, W - M, M + r * 135, 2, COL.black, 0, 'back'));
+  const L = lines.filter((_, i) => grow >= (i + 1) / lines.length);
+  for (let r = 0; r < 8; r++) for (let c = 0; c < 6; c++) {
+    if (!filled(P, c, r)) continue;
+    const red = c + r * 6 === P.grid.red;
+    L.push(box(M + c * 135, M + r * 135, M + (c + 1) * 135, M + (r + 1) * 135,
+      red ? COL.red : COL.black, cellStage(P, c, r), red ? 'front' : 'mid'));
+  }
+  L.push(txt(P.words[0], P.alignX, 169, 34, 1, 0, COL.black, 1, 'mid'));
+  L.push(txt(P.words[0][0], P.alignX, 1215, 540, 1, 1, COL.red, 3, 'front'));
+  return L;
+}
+
+// ACT 2 DIAL: one giant letter, cropped by the frame, snaps between the dial extremes.
+function items2(P, b) {
+  const wgt = clamp(drive(DIAL_W, b));
+  const sx = lerp(0.45, 1.6, clamp(drive(DIAL_X, b)));
+  return [
+    txt(P.words[0][0], P.alignX, 1674, 1080, sx, wgt, COL.black, 0, 'mid'),   // baseline below the frame
+    txt(P.words[1], P.alignX, 169, 34, 1, 0, COL.black, 0, 'mid'),
+  ];
+}
+
+// ACT 3 MORPH: the letters of word 1 morph one into the next, one per beat, with motion blur.
+function items3(P, b, t) {
+  const Lt = P.words[0];
+  const cap = P.morphCaps[b.j];
+  const base = cap === 1080 ? 1674 : 1215;
+  const it = txt(Lt[b.j % Lt.length], P.alignX, base, cap, P.morphSx, 1, COL.black, 0, 'mid');
+  it.morphTo = Lt[(b.j + 1) % Lt.length];
+  it.mor = [0, 1, 2].map(s => ({ m: moveAt(t - s / 180), a: s === 0 ? 1 : 0.35 }));
+  return [it, txt(P.words[1], P.alignX, 169, 34, 1, 0, COL.black, 0, 'mid')];
+}
+
+// ACT 4 DEPTH: three words on three parallax layers; the type block swings on beat 3.
+function items4(P, b, t) {
+  const D = P.depth;
+  const th = drive(SWING, b) * Math.PI / 180;
+  const s = PERSP / (PERSP + 300 * Math.sin(th));              // nearer edge looks bigger
+  const a = Math.cos(th) * s;                                  // width shrinks to 0 at 90 degrees
+  const grp = [a, 0, 0, s, P.alignX * (1 - a), 675 * (1 - s)]; // hinge on the axis, at mid-height
+  const w1 = txt(P.words[0], P.alignX, D.b1, D.c1, 0.6, 1, COL.black, 0, 'mid');
+  const w2 = txt(P.words[1], P.alignX, D.b2, D.c2, 0.8, 1, COL.black, 0, 'back');
+  const w3 = txt(P.words[2], P.alignX, D.b3, 34, 1, 0, COL.red, 0, 'front');
+  w1.grp = w2.grp = w3.grp = grp;
+  w1.dx = 80 * Math.sin(2 * Math.PI * 2 * (t - 8) / LOOP);     // each layer slides at its own speed
+  w2.dx = 40 * Math.sin(2 * Math.PI * 1 * (t - 8) / LOOP);
+  w3.dx = 160 * Math.sin(2 * Math.PI * 3 * (t - 8) / LOOP);
+  return [w1, w2, w3];
+}
+
+// ACT 5 SWARM: the particles are drawn in paintSwarm(); here we only describe their area.
+function items5(P) {
+  return [
+    { kind: 'particles', cap: 540, col: COL.black, from: 0, layer: 'mid', bbox: LIVE },
+    txt(P.words[2], P.alignX, 169, 34, 1, 0, COL.black, 0, 'mid'),
+  ];
+}
+
+// ACT 6 LOCKUP: word 1 huge (cropped by the frame), red rule, words 2 and 3 small, caption.
+// Beats 1 to 3 push in slowly; beat 4 is the white cut, so nothing is drawn.
+function items6(P, b) {
+  if (b.j === 3) return [];
+  const s = 1 + 0.06 * drive(PUSH, b);
+  const grp = [s, 0, 0, s, P.alignX * (1 - s), 675 * (1 - s)];
+  const items = [
+    txt(P.words[0], P.alignX, 675, 540, 0.7, 1, COL.black, 0, 'mid'),
+    hrule(P.alignX, LIVE.x1, 810, 17, COL.red, 0, 'front'),
+    txt(P.words[1], P.alignX, 945, 68, 1, 1, COL.black, 0, 'mid'),
+    txt(P.words[2], P.alignX, 1080, 34, 1, 1, COL.black, 0, 'mid'),
+    txt(P.caption, P.alignX, 1215, 34, fitSx(P.caption, 34, LIVE.x1 - P.alignX), 0, COL.black, 0, 'mid'),
+  ];
+  for (const it of items) it.grp = grp;
+  return items;
+}
+
+// Dispatch: the items for act a (0 to 5) on beat b at time t.
+function actItems(P, a, b, t) {
+  switch (a) {
+    case 0: return items1(P, t, b);
+    case 1: return items2(P, b);
+    case 2: return items3(P, b, t);
+    case 3: return items4(P, b, t);
+    case 4: return items5(P);
+    default: return items6(P, b);
+  }
+}
+
+/* ==== 6. THE SWARM: 2400 particles, four shapes ====
+   Shape 0: grid dots. Shape 1: the second word's first letter.
+   Shape 2: little modules, one per grid cell. Shape 3: back to grid dots. */
+function swarmTargets(P) {
+  if (P._sw) return P._sw;
+  const N = 2400;
+  const dots = new Float32Array(2 * N), mods = new Float32Array(2 * N);
+  const delay = new Float32Array(N), wx = new Float32Array(N), wy = new Float32Array(N);
+  for (let i = 0; i < N; i++) {
+    const c = i % 48, r = Math.floor(i / 48);                      // 48 by 50 grid of dots
+    dots[2 * i] = M + (c + 0.5) * (810 / 48);
+    dots[2 * i + 1] = M + (r + 0.5) * (1080 / 50);
+    const cell = i % 48, q = Math.floor(i / 48);                   // 48 cells, 50 particles each
+    mods[2 * i] = M + (cell % 6) * 135 + 14 + (q % 8) * (107 / 7);
+    mods[2 * i + 1] = M + Math.floor(cell / 6) * 135 + 14 + Math.floor(q / 8) * (107 / 7);
+    delay[i] = 0.35 * h01(i, 1);                                   // some particles start a little late
+    wx[i] = 2 * h01(i, 2) - 1;
+    wy[i] = 2 * h01(i, 3) - 1;
+  }
+  const letter = sampleLetter(P.words[1][0], P.alignX, 1215, 540, 1, N);
+  return (P._sw = { N, delay, wx, wy, states: [dots, letter, mods, dots] });
+}
+
+// Draw the swarm for beat b: every particle moves from its shape to the next one.
+function paintSwarm(P, b, LX) {
+  const sw = swarmTargets(P);
+  const A = sw.states[b.j], B = sw.states[NEXT_SW[b.j]];
+  const m = b.m;
+  for (let i = 0; i < sw.N; i++) {
+    const red = i % 13 === 0;                                      // every 13th particle is red
+    const ctx = red ? LX.front : LX.mid;
+    ctx.fillStyle = red ? COL.red : COL.black;
+    const d = sw.delay[i];
+    for (const [mm, alpha] of [[clamp(m - 0.1), 0.35], [m, 1]]) {  // faint trail, then the particle
+      const mi = clamp((mm - d) / (1 - d));
+      const wob = Math.sin(Math.PI * mi) * 40;                     // swarm wobble, biggest mid-move
+      const x = lerp(A[2 * i], B[2 * i], mi) + sw.wx[i] * wob;
+      const y = lerp(A[2 * i + 1], B[2 * i + 1], mi) + sw.wy[i] * wob;
+      ctx.globalAlpha = alpha;
+      ctx.fillRect(x - 1.5, y - 1.5, 3, 3);
+    }
+    ctx.globalAlpha = 1;
+  }
+}
+
+/* ==== 7. DRAWING THE ITEMS ON THE THREE LAYERS ==== */
+// Paint every item that has arrived by this beat. Each item goes on its own layer:
+// back = grid, mid = black type, front = red.
+function paint(P, items, b, t, LX) {
+  for (const it of items) {
+    if (b.j < it.from) continue;                       // not arrived yet on this beat
+    if (it.kind === 'particles') { paintSwarm(P, b, LX); continue; }
+    const ctx = LX[it.layer];
+    ctx.save();
+    if (it.grp) ctx.transform(...it.grp);              // group motion: swing or push
+    if (it.dx) ctx.translate(it.dx, 0);                // parallax shift for this layer
+    if (it.kind === 'text') {
+      if (it.morphTo) drawMorphBlur(ctx, it);
+      else drawWord(ctx, it.str, it.x, it.base, it.cap, it.sx, it.wgt, it.col);
+    } else {                                           // rules and filled cells
+      ctx.fillStyle = it.col;
+      const bb = it.bbox;
+      ctx.fillRect(bb.x0, bb.y0, bb.x1 - bb.x0, bb.y1 - bb.y0);
+    }
+    ctx.restore();
+  }
+}
+
+/* ==== 8. CANVASES, LAYERS, CLEAN COMPOSITE, OVERLAYS ====
+   Three layer canvases hold the poster: back (grid), mid (black type), front (red).
+   The clean composite stacks them on white; red over black multiplies (overprint). */
+const OUT = document.getElementById('out'), GLC = document.getElementById('gl'), OV = document.getElementById('ov');
+const OUTX = OUT.getContext('2d'), OVX = OV.getContext('2d');
+const LAY = {}, LAYX = {};
+for (const k of ['back', 'mid', 'front']) {
+  LAY[k] = document.createElement('canvas');
+  // willReadFrequently keeps the layers in CPU memory, so the WebGL upload always sees the newest drawing
+  LAYX[k] = LAY[k].getContext('2d', { willReadFrequently: true });
+}
+let K = 1;                 // internal pixels per logical pixel (set by resize)
+let PLAN = null;           // the edition being shown
+let EDITION = 1;
+let finishOn = false;      // print finish (WebGL2) on or off; F toggles it
+let showBeat = false, showCritic = false;   // D and C overlays
+let lastMs = 0;            // how long the last frame took to draw (ms)
+
+function composite2D() {
+  OUTX.setTransform(1, 0, 0, 1, 0, 0);
+  OUTX.globalCompositeOperation = 'source-over';
+  OUTX.fillStyle = COL.white;
+  OUTX.fillRect(0, 0, OUT.width, OUT.height);
+  OUTX.drawImage(LAY.back, 0, 0);
+  OUTX.drawImage(LAY.mid, 0, 0);
+  OUTX.globalCompositeOperation = 'multiply';         // overprint: red ink multiplies over black
+  OUTX.drawImage(LAY.front, 0, 0);
+  OUTX.globalCompositeOperation = 'source-over';
+}
+
+// Draw the overlays (D and C) with our own letters, on their own canvas.
+function drawOverlay(b) {
+  OVX.setTransform(K, 0, 0, K, 0, 0);
+  OVX.clearRect(0, 0, W, H);
+  if (showBeat) {
+    OVX.fillStyle = COL.white;
+    OVX.fillRect(20, 1250, 230, 80);
+    drawWord(OVX, (b.act + 1) + '.' + (b.j + 1), 40, 1310, 68, 1, 0, COL.black);   // bar.beat
+  }
+  if (showCritic && PLAN) {
+    const P = PLAN;
+    const names = ['GRID', 'TYPE', 'AXIS', 'SIZE', 'WEIGHT', 'RULE', 'EDGE', 'COLOUR', 'NO 540'];
+    OVX.fillStyle = COL.white;
+    OVX.fillRect(20, 20, 560, 110 + names.length * 40 + 60);
+    drawWord(OVX, 'EDITION ' + P.n + (P.fails.length ? ' FAIL' : ' PASS'), 40, 70, 34, 1, 0, COL.black);
+    names.forEach((name, i) => {
+      const bad = P.fails.some(f => f.includes(name));
+      drawWord(OVX, name + (bad ? ' FAIL' : ' OK'), 40, 130 + i * 40, 34, 0, 0, bad ? COL.red : COL.black);
+    });
+    drawWord(OVX, 'TRY ' + (P.sub + 1) + (P.firstTry ? ' FIRST' : ' RETRY'), 40, 170 + names.length * 40, 34, 0, 0, COL.black);
+  }
+}
+
+// Draw one frame for time t (seconds, 0 to 16).
+function draw(t) {
+  const t0 = performance.now();
+  const b = beatAt(t);
+  for (const k in LAYX) {
+    LAYX[k].setTransform(K, 0, 0, K, 0, 0);
+    LAYX[k].clearRect(0, 0, W, H);
+  }
+  paint(PLAN, actItems(PLAN, b.act, b, t), b, t, LAYX);
+  present();
+  drawOverlay(b);
+  lastMs = performance.now() - t0;
+}
+
+/* ==== 9. PRINT FINISH (WebGL2) ====
+   The shader stacks the three layers like ink: the back layer is softened slightly,
+   inks multiply, a fine line screen thins the mid-tones, and paper grain is added.
+   If WebGL2 is missing, the clean composite stays on screen. */
+const VS = `#version 300 es
+in vec2 corner;
+void main() { gl_Position = vec4(corner, 0.0, 1.0); }`;
+const FS = `#version 300 es
+precision highp float;
+uniform sampler2D uBack, uMid, uFront;
+uniform vec2 uRes;      // output size in device pixels
+uniform float uK;       // device pixels per logical pixel
+out vec4 outColor;
+
+// Each layer is premultiplied RGBA. An empty spot (alpha 0) becomes white (1.0),
+// so each layer becomes a multiply factor: rgb + (1 - alpha).
+vec3 factor(sampler2D s, vec2 uv) {
+  vec4 c = texture(s, uv);
+  return c.rgb + (1.0 - c.a);
+}
+// A fixed random value per pixel: the grain is the same every frame.
+float rnd(vec2 p) { return fract(sin(dot(p, vec2(12.9898, 78.233))) * 43758.5453); }
+
+void main() {
+  vec2 uv = gl_FragCoord.xy / uRes;
+  // 1. Back layer: average 9 nearby samples, a soft depth-of-field blur
+  vec2 step1 = vec2(1.6 * uK) / uRes;
+  vec3 back = vec3(0.0);
+  for (int i = -1; i <= 1; i++)
+    for (int j = -1; j <= 1; j++)
+      back += factor(uBack, uv + vec2(float(i), float(j)) * step1);
+  back /= 9.0;
+  // 2. Middle (black type) and front (red) layers, sharp
+  vec3 mid = factor(uMid, uv);
+  vec3 front = factor(uFront, uv);
+  // 3. Overprint: the inks multiply, as real ink does
+  vec3 ink = back * mid * front;
+  // 4. Line screen: in mid-tones, every other fine line drops to a lighter tint
+  float density = 1.0 - dot(ink, vec3(0.333));
+  float line = step(fract(gl_FragCoord.y / (3.0 * uK)), density);
+  ink = mix(ink, vec3(1.0), (1.0 - line) * density * 0.25);
+  // 5. Paper grain
+  ink += (rnd(floor(gl_FragCoord.xy)) - 0.5) * 0.04;
+  outColor = vec4(clamp(ink, 0.0, 1.0), 1.0);
+}`;
+
+let GLR = null;   // { gl, tex, uRes, uK } once WebGL2 is set up
+function initGL() {
+  let gl = null;
+  try { gl = GLC.getContext('webgl2', { antialias: false, alpha: false }); } catch (e) { gl = null; }
+  if (!gl) return null;
+  const compile = (type, src) => {
+    const s = gl.createShader(type);
+    gl.shaderSource(s, src);
+    gl.compileShader(s);
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
+    return s;
+  };
+  try {
+    const prog = gl.createProgram();
+    gl.attachShader(prog, compile(gl.VERTEX_SHADER, VS));
+    gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, FS));
+    gl.bindAttribLocation(prog, 0, 'corner');
+    gl.linkProgram(prog);
+    if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(prog));
+    gl.useProgram(prog);
+    // One big quad that covers the whole canvas
+    gl.bindBuffer(gl.ARRAY_BUFFER, gl.createBuffer());
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), gl.STATIC_DRAW);
+    gl.enableVertexAttribArray(0);
+    gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+    // One texture per layer
+    const tex = [];
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+    gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, true);
+    for (let i = 0; i < 3; i++) {
+      const t = gl.createTexture();
+      gl.activeTexture(gl.TEXTURE0 + i);
+      gl.bindTexture(gl.TEXTURE_2D, t);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+      tex.push(t);
+    }
+    const u = name => gl.getUniformLocation(prog, name);
+    gl.uniform1i(u('uBack'), 0);
+    gl.uniform1i(u('uMid'), 1);
+    gl.uniform1i(u('uFront'), 2);
+    return { gl, tex, uRes: u('uRes'), uK: u('uK') };
+  } catch (e) {
+    console.warn('WebGL2 finish unavailable:', e.message);
+    return null;
+  }
+}
+function drawGL() {
+  const g = GLR.gl;
+  g.viewport(0, 0, GLC.width, GLC.height);
+  const src = [LAY.back, LAY.mid, LAY.front];
+  for (let i = 0; i < 3; i++) {
+    g.activeTexture(g.TEXTURE0 + i);
+    g.bindTexture(g.TEXTURE_2D, GLR.tex[i]);
+    g.texImage2D(g.TEXTURE_2D, 0, g.RGBA, g.RGBA, g.UNSIGNED_BYTE, src[i]);
+  }
+  g.uniform2f(GLR.uRes, GLC.width, GLC.height);
+  g.uniform1f(GLR.uK, K);
+  g.drawArrays(g.TRIANGLE_STRIP, 0, 4);
+}
+
+// Show either the WebGL finish or the clean composite.
+function present() {
+  const useGL = finishOn && GLR !== null;
+  GLC.style.display = useGL ? 'block' : 'none';
+  OUT.style.display = useGL ? 'none' : 'block';
+  if (useGL) drawGL(); else composite2D();
+}
+
+/* ==== 10. SIZE, CLOCK, KEYS, EDITIONS ==== */
+// Fit the poster to the window, with canvas pixels matching the screen (capped at 2x).
+function resize() {
+  const fit = Math.min(window.innerWidth / W, window.innerHeight / H);
+  const dpr = Math.min(2, window.devicePixelRatio || 1);
+  const cw = Math.max(1, Math.round(W * fit * dpr));
+  const ch = Math.round(cw * H / W);
+  K = cw / W;
+  for (const c of [OUT, GLC, OV, LAY.back, LAY.mid, LAY.front]) { c.width = cw; c.height = ch; }
+  for (const c of [OUT, GLC, OV]) { c.style.width = (W * fit) + 'px'; c.style.height = (H * fit) + 'px'; }
+  const stage = document.getElementById('stage');          // the wrapper needs a size to be centred
+  stage.style.width = (W * fit) + 'px';
+  stage.style.height = (H * fit) + 'px';
+  draw(now());
+}
+
+// The clock: runs from 0 to 16 seconds and wraps. While paused it stays frozen.
+let tStart = performance.now();
+let clockOn = null;        // null = running; otherwise the frozen time in seconds
+function now() {
+  return clockOn !== null ? clockOn : ((performance.now() - tStart) / 1000) % LOOP;
+}
+function togglePause() {
+  if (clockOn === null) {
+    clockOn = now();
+  } else {
+    tStart = performance.now() - clockOn * 1000;   // carry on from the frozen moment
+    clockOn = null;
+  }
+}
+function stepBeat(dir) {
+  const k = Math.round(now() * 1.5) + dir;
+  clockOn = ((k / 1.5) % LOOP + LOOP) % LOOP;
+}
+
+// Editions are cached, so going back to one is instant.
+const EDITIONS = new Map();
+function getEdition(n) {
+  if (!EDITIONS.has(n)) EDITIONS.set(n, buildEdition(n));
+  return EDITIONS.get(n);
+}
+function setEdition(n) {
+  EDITION = Math.max(1, n);
+  PLAN = getEdition(EDITION);
+  try { history.replaceState(null, '', '?seed=' + EDITION); } catch (e) { /* not allowed here: fine */ }
+  draw(now());
+}
+
+window.addEventListener('keydown', e => {
+  const k = e.key.toLowerCase();
+  if (e.code === 'Space') { e.preventDefault(); togglePause(); }
+  else if (e.key === 'ArrowRight') { e.preventDefault(); stepBeat(1); }
+  else if (e.key === 'ArrowLeft') { e.preventDefault(); stepBeat(-1); }
+  else if (k === 'n') setEdition(EDITION + 1);
+  else if (k === 'b') setEdition(EDITION - 1);
+  else if (k === 'd') showBeat = !showBeat;
+  else if (k === 'c') showCritic = !showCritic;
+  else if (k === 'f' && GLR) {
+    finishOn = !finishOn;
+  }
+});
+window.addEventListener('resize', resize);
+
+// Helpers for testing from outside: jump to a time, run the critic over many editions, time a frame.
+window.seek = t => { clockOn = ((t % LOOP) + LOOP) % LOOP; draw(clockOn); };
+window.edition = n => setEdition(n);
+window.criticRun = (from, to) => {
+  let firstPass = 0, finalPass = 0;
+  const failCounts = {};
+  for (let n = from; n <= to; n++) {
+    const P = buildEdition(n);
+    if (P.firstTry) firstPass++;
+    if (P.fails.length === 0) finalPass++;
+    for (const f of P.fails) failCounts[f] = (failCounts[f] || 0) + 1;
+  }
+  return { editions: to - from + 1, firstTryPass: firstPass, finalPass, failCounts };
+};
+window.bench = (frames = 240) => {
+  const t0 = performance.now();
+  for (let i = 0; i < frames; i++) draw((i * LOOP) / frames);   // sweep the whole loop
+  return (performance.now() - t0) / frames;                    // average ms per frame
+};
+window.glOn = () => GLR !== null;
+
+/* ==== BOOT ==== */
+PLAN = getEdition(EDITION);
+const qs = new URLSearchParams(location.search);
+const seed = parseInt(qs.get('seed') || '1', 10);
+if (seed >= 1) { EDITION = seed; PLAN = getEdition(EDITION); }
+GLR = initGL();
+if (!GLR) GLC.style.display = 'none';
+finishOn = GLR !== null;
+resize();
+function loop() { draw(now()); requestAnimationFrame(loop); }
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
