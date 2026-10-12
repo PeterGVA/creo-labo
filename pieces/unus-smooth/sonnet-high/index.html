@@ -1,0 +1,897 @@
+<!DOCTYPE html>
+<html lang="la">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<title>Unus Smooth</title>
+<style>
+  /* The page is just a black stage with one canvas in the middle. */
+  html, body { margin: 0; height: 100%; background: #000000; overflow: hidden; }
+  body { display: flex; align-items: center; justify-content: center; }
+  canvas { display: block; }
+  /* Touch buttons (HTML on top of the canvas, not part of the artwork).
+     Their opacity is set from JavaScript every frame, so there is no CSS transition. */
+  #bar { position: fixed; left: 0; right: 0; bottom: 0; display: flex; gap: 6px;
+         padding: 8px 8px calc(8px + env(safe-area-inset-bottom)); opacity: 0; pointer-events: none; }
+  #bar button { flex: 1; min-height: 48px; padding: 0; background: #111111; color: #ffffff;
+                border: 1px solid #ffffff; border-radius: 0;
+                font: 700 14px "Helvetica Neue", Helvetica, Arial, sans-serif; }
+  #bar button.on { background: #e30613; border-color: #e30613; }
+  /* Small bar.beat read-out (key D). */
+  #dbg { position: fixed; left: 8px; top: 8px; display: none; color: #ffffff; background: rgba(0,0,0,.6);
+         padding: 4px 6px; font: 12px/1.2 monospace; pointer-events: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="dbg"></div>
+<div id="bar">
+  <button id="bPlay">Play/Pause</button>
+  <button id="bPrev">&#9664; Beat</button>
+  <button id="bNext">Beat &#9654;</button>
+  <button id="bD">D</button>
+  <button id="bM">M</button>
+  <button id="bF">F</button>
+</div>
+
+<script>
+/* =====================================================================
+   UNUS PRO OMNIBUS, OMNES PRO UNO  --  "Unus Smooth"
+   1080 x 1350, 16 s loop, 90 BPM, 4/4.  Vanilla JS + Canvas 2D only.
+
+   How the file is organised (read it top to bottom):
+     1. Constants and small maths helpers (grid, easing, spring)
+     2. Drawing helpers: every one of them draws AND records what it drew
+     3. The score: all shapes, words and marks as pure functions of time t
+     4. renderFrame(t): draws one frame, returns the records
+     5. The frame check (window.frameCheck) and the green/red F view
+     6. Playback, keys, tap buttons, drum metronome
+   Nothing is random and nothing keeps state between frames: the picture
+   at time t depends only on t.
+   ===================================================================== */
+(function () {
+'use strict';
+
+/* ---------------------------------------------------------------------
+   1. CONSTANTS AND MATHS
+   --------------------------------------------------------------------- */
+const W = 1080, H = 1350;              // frame size in "frame pixels"
+const MARGIN = 135, CELL = 135;        // 6 columns x 8 rows of 135 px squares inside 135 px margins
+const COLS = 6, ROWS = 8;
+const LIVE = { x0: 135, y0: 135, x1: 945, y1: 1215 };   // the live area (810 x 1080)
+const INSET = 15;                      // one inset for the whole piece: shapes are 105 px, neighbours 30 px apart
+const BEAT = 2 / 3, BAR = 8 / 3, LOOP = 16;   // 90 BPM
+const RED = '#e30613', INK = '#111111', WHITE = '#ffffff';
+const FONT = '"Helvetica Neue", Helvetica, Arial, sans-serif';
+const SIZES = [52, 84, 136];           // the only three text sizes
+const MIN_GAP = 17;                    // minimum empty space between things
+const MAX_STEP = 24;                   // max edge movement per frame (px)
+
+const beat = n => n * BEAT;            // beat number -> seconds
+const gx = c => MARGIN + CELL * c;     // x of grid line c
+const gy = r => MARGIN + CELL * r;     // y of grid line r
+
+// smoothstep: eases in and out, 0..1
+function sm(x) { return x <= 0 ? 0 : x >= 1 ? 1 : x * x * (3 - 2 * x); }
+
+/* Damped spring.  springStep(tau, wn) is the response of a spring that is
+   pushed from 0 to 1 at tau = 0.  Damping ratio 0.8 gives only 1.5 %
+   overshoot (the brief allows 10 %).  It starts with zero speed (eases in),
+   reaches 1 for the first time at crossTime(wn) and then settles.  After the
+   settle time we return exactly 1, so a resting shape sits exactly on the grid.
+   Moves can be added together because the spring is linear.                    */
+const ZETA = 0.8, SQ = Math.sqrt(1 - ZETA * ZETA);
+function crossTime(wn) { return Math.PI / (wn * SQ); }
+function springStep(tau, wn) {
+  if (tau <= 0) return 0;
+  if (tau >= 13 / wn) return 1;               // settled (residual < 0.03 px): snap to exactly 1
+  const wd = wn * SQ;
+  return 1 - Math.exp(-ZETA * wn * tau) * (Math.cos(wd * tau) + (ZETA / SQ) * Math.sin(wd * tau));
+}
+// Choose a spring stiffness so the fastest edge stays under ~19 px per frame.
+function wnFor(dist) { return Math.min(14, 2700 / Math.max(dist, 1)); }
+
+/* ---------------------------------------------------------------------
+   2. DRAWING HELPERS (draw + record)
+   --------------------------------------------------------------------- */
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+let rec = [];            // records of the frame being drawn
+let DRY = false;         // true = record only, do not paint
+
+// scratch context used to measure text (measureText works the same on any canvas)
+const mctx = document.createElement('canvas').getContext('2d');
+const measureCache = new Map();
+function measure(str, size, weight) {
+  const key = weight + '|' + size + '|' + str;
+  let m = measureCache.get(key);
+  if (!m) {
+    mctx.font = weight + ' ' + size + 'px ' + FONT;
+    const t = mctx.measureText(str);
+    m = { abl: t.actualBoundingBoxLeft, abr: t.actualBoundingBoxRight,
+          asc: t.actualBoundingBoxAscent, desc: t.actualBoundingBoxDescent,
+          w: t.actualBoundingBoxLeft + t.actualBoundingBoxRight };
+    measureCache.set(key, m);
+  }
+  return m;
+}
+
+// background field: dark = 0 (white) .. 1 (black).  mode 'fade' = crossfade, 'wipe' = white slides in from the left.
+function field(dark, mode) {
+  rec.push({ id: 'field', kind: 'field', x: 0, y: 0, w: W, h: H, dark: dark, mode: mode, alpha: 1, color: '' });
+  if (DRY) return;
+  ctx.globalAlpha = 1;
+  if (mode === 'fade') {
+    const v = Math.round(255 + (17 - 255) * dark);
+    ctx.fillStyle = 'rgb(' + v + ',' + v + ',' + v + ')';
+    ctx.fillRect(0, 0, W, H);
+  } else {
+    ctx.fillStyle = INK; ctx.fillRect(0, 0, W, H);
+    ctx.fillStyle = WHITE; ctx.fillRect(0, 0, W * (1 - dark), H);
+  }
+}
+function rect(id, x, y, w, h, color, alpha) {
+  if (alpha <= 0.002 || w <= 0 || h <= 0) return;
+  rec.push({ id: id, kind: 'rect', x: x, y: y, w: w, h: h, color: color, alpha: alpha });
+  if (DRY) return;
+  ctx.globalAlpha = alpha; ctx.fillStyle = color; ctx.fillRect(x, y, w, h);
+}
+function circle(id, cx, cy, r, color, alpha) {
+  if (alpha <= 0.002 || r <= 0) return;
+  rec.push({ id: id, kind: 'circle', x: cx - r, y: cy - r, w: 2 * r, h: 2 * r, cx: cx, cy: cy, r: r, color: color, alpha: alpha });
+  if (DRY) return;
+  ctx.globalAlpha = alpha; ctx.fillStyle = color;
+  ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI * 2); ctx.fill();
+}
+// path: draw(ctx) builds the outline; the record keeps the path's box
+function path(id, x, y, w, h, build, color, alpha) {
+  if (alpha <= 0.002 || w <= 0 || h <= 0) return;
+  rec.push({ id: id, kind: 'path', x: x, y: y, w: w, h: h, color: color, alpha: alpha });
+  if (DRY) return;
+  ctx.globalAlpha = alpha; ctx.fillStyle = color;
+  build(ctx); ctx.fill();
+}
+function line(id, x1, y1, x2, y2, th, color, alpha) {
+  if (alpha <= 0.002) return;
+  const bx = Math.min(x1, x2) - (x1 === x2 ? th / 2 : 0), by = Math.min(y1, y2) - (y1 === y2 ? th / 2 : 0);
+  const bw = Math.abs(x2 - x1) + (x1 === x2 ? th : 0), bh = Math.abs(y2 - y1) + (y1 === y2 ? th : 0);
+  rec.push({ id: id, kind: 'line', x: bx, y: by, w: bw, h: bh, x1: x1, y1: y1, x2: x2, y2: y2, th: th, color: color, alpha: alpha });
+  if (DRY) return;
+  ctx.globalAlpha = alpha; ctx.strokeStyle = color; ctx.lineWidth = th; ctx.lineCap = 'butt';
+  ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2); ctx.stroke();
+}
+// text: (xInk, baseline) = where the INK starts / the baseline; the record keeps the real ink box
+function text(id, str, size, weight, xInk, baseline, color, alpha) {
+  if (alpha <= 0.002) return;
+  const m = measure(str, size, weight);
+  rec.push({ id: id, kind: 'text', text: str, size: size, weight: weight, x: xInk, y: baseline - m.asc, w: m.w, h: m.asc + m.desc,
+             color: color, alpha: alpha });
+  if (DRY) return;
+  ctx.globalAlpha = alpha; ctx.fillStyle = color;
+  ctx.font = weight + ' ' + size + 'px ' + FONT; ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic';
+  ctx.fillText(str, xInk + m.abl, baseline);
+}
+
+/* ---------------------------------------------------------------------
+   3. THE SCORE
+   --------------------------------------------------------------------- */
+
+/* ---- colour helper (for colour changes over time) ---- */
+function hex2rgb(h) { return [parseInt(h.slice(1, 3), 16), parseInt(h.slice(3, 5), 16), parseInt(h.slice(5, 7), 16)]; }
+function mixColor(a, b, k) {
+  if (k <= 0) return a; if (k >= 1) return b;
+  const A = hex2rgb(a), B = hex2rgb(b);
+  return 'rgb(' + Math.round(A[0] + (B[0] - A[0]) * k) + ',' + Math.round(A[1] + (B[1] - A[1]) * k) + ',' + Math.round(A[2] + (B[2] - A[2]) * k) + ')';
+}
+
+/* ---- background ---- */
+// Crossfade to black over beats 10.5 -> 12 (7.000 -> 8.000 s), wipe back to white over beats 18.5 -> 20 (12.333 -> 13.333 s).
+function background(t) {
+  if (t <= 7) return { dark: 0, mode: 'fade' };
+  if (t < 8) return { dark: sm((t - 7) / 1), mode: 'fade' };
+  if (t <= beat(18.5)) return { dark: 1, mode: 'fade' };
+  if (t < beat(20)) return { dark: 1 - sm((t - beat(18.5)) / (beat(20) - beat(18.5))), mode: 'wipe' };
+  return { dark: 0, mode: 'wipe' };
+}
+
+/* ---- SHAPES -----------------------------------------------------------
+   A shape is a box whose four edges follow springs.  A "module" is one
+   grid cell (box = cell shrunk by INSET).  Everything a shape does is stored
+   as data: when it is born, moves, pulses, changes colour, leaves.         */
+const shapes = [];
+function cellBox(c, r, w, h) {
+  w = w || 1; h = h || 1;
+  return { l: gx(c) + INSET, t: gy(r) + INSET, r: gx(c + w) - INSET, b: gy(r + h) - INSET };
+}
+function mkShape(id, kind, box, color) {
+  const s = { id: id, kind: kind, l0: box.l, t0: box.t, r0: box.r, b0: box.b, color: color,
+              born: null, moves: [], pulses: [], out: null, recolor: null, morph: null };
+  shapes.push(s);
+  return s;
+}
+// grow from nothing at its own place; `hit` = the moment it reaches full size
+function bornAt(s, hit, wn) { s.born = { hit: hit, wn: wn || 13 }; }
+// edge move: each of the four edges moves by its own distance
+function edgeMove(s, hit, wn, dl, dt, dr, db) { s.moves.push({ hit: hit, wn: wn, dl: dl, dt: dt, dr: dr, db: db }); }
+// whole-shape move by (dx, dy) px, landing exactly on `hit`
+function moveBy(s, hit, dx, dy) {
+  const d = Math.max(Math.abs(dx), Math.abs(dy)); if (!d) return;
+  edgeMove(s, hit, wnFor(d), dx, dy, dx, dy);
+}
+function pulseAt(s, t0, amp, dur) { s.pulses.push([t0, amp || 0.12, dur || 0.16]); }
+function leaveAt(s, t0, dur, mode) { s.out = { t0: t0, dur: dur, mode: mode || 'shrink' }; }
+
+// State of a shape at time t (or null if it is not on screen)
+function shapeAt(s, t) {
+  let g = 1, a = 1;
+  if (s.born) {
+    const st = s.born.hit - crossTime(s.born.wn);
+    if (t <= st) return null;
+    g = springStep(t - st, s.born.wn);
+    a = sm((t - st) / 0.2);
+    if (g <= 0) return null;
+  }
+  const cx0 = (s.l0 + s.r0) / 2, cy0 = (s.t0 + s.b0) / 2, hw0 = (s.r0 - s.l0) / 2, hh0 = (s.b0 - s.t0) / 2;
+  let l = cx0 - hw0 * g, r = cx0 + hw0 * g, tp = cy0 - hh0 * g, b = cy0 + hh0 * g;
+  for (let i = 0; i < s.moves.length; i++) {
+    const m = s.moves[i];
+    const k = springStep(t - (m.hit - crossTime(m.wn)), m.wn);
+    if (k) { l += m.dl * k; tp += m.dt * k; r += m.dr * k; b += m.db * k; }
+  }
+  let f = 1;                                           // size factor from pulses / leaving
+  for (let i = 0; i < s.pulses.length; i++) {
+    const p = s.pulses[i], u = (t - p[0]) / p[2];
+    if (u > 0 && u < 1) { const v = Math.sin(Math.PI * u); f -= p[1] * v * v; }
+  }
+  if (s.out) {
+    const p = sm((t - s.out.t0) / s.out.dur);
+    if (p >= 1) return null;
+    if (s.out.mode === 'shrink') f *= 1 - p;
+    a *= 1 - p;
+  }
+  const cx = (l + r) / 2, cy = (tp + b) / 2, hw = (r - l) / 2 * f, hh = (b - tp) / 2 * f;
+  let color = s.color;
+  if (s.recolor) color = mixColor(s.color, s.recolor.to, sm((t - s.recolor.t0) / (s.recolor.t1 - s.recolor.t0)));
+  return { cx: cx, cy: cy, x: cx - hw, y: cy - hh, w: 2 * hw, h: 2 * hh, a: a, color: color };
+}
+
+// rounded rectangle path (radius r); with r = w/2 on a square it is a circle
+function roundedRect(c, x, y, w, h, r) {
+  c.beginPath();
+  c.moveTo(x + r, y);
+  c.arcTo(x + w, y, x + w, y + h, r);
+  c.arcTo(x + w, y + h, x, y + h, r);
+  c.arcTo(x, y + h, x, y, r);
+  c.arcTo(x, y, x + w, y, r);
+  c.closePath();
+}
+
+function drawShape(s, t) {
+  const st = shapeAt(s, t);
+  if (!st || st.a <= 0.002 || st.w <= 0.01) return;
+  if (s.kind === 'rect') rect(s.id, st.x, st.y, st.w, st.h, st.color, st.a);
+  else if (s.kind === 'circle') circle(s.id, st.cx, st.cy, st.w / 2, st.color, st.a);
+  else if (s.kind === 'tri') {
+    path(s.id, st.x, st.y, st.w, st.h, function (c) {
+      c.beginPath(); c.moveTo(st.x + st.w / 2, st.y); c.lineTo(st.x + st.w, st.y + st.h); c.lineTo(st.x, st.y + st.h); c.closePath();
+    }, st.color, st.a);
+  } else if (s.kind === 'morph') {
+    // square -> rounded square -> circle.  Every in-between is one simple closed shape with no kinks.
+    const q = sm((t - s.morph.t0) / (s.morph.t1 - s.morph.t0));
+    const r = q * Math.min(st.w, st.h) / 2;
+    if (q >= 1 && t >= s.morph.snap) circle(s.id, st.cx, st.cy, st.w / 2, st.color, st.a);
+    else path(s.id, st.x, st.y, st.w, st.h, function (c) { roundedRect(c, st.x, st.y, st.w, st.h, r); }, st.color, st.a);
+  }
+}
+
+/* ---- Act 1 (beats 0-4): UNUS.  One big red square lands (2x2 cells) ---- */
+const B1 = mkShape('sq_4_6', 'rect', cellBox(4, 6, 2, 2), RED);
+bornAt(B1, 0.62, 8.4);                                   // starts from plain white at t=0, lands late (0.62 s)
+pulseAt(B1, beat(2) - 0.05, 0.07, 0.3);                  // soft hit on beat 3: a gentle breath
+edgeMove(B1, beat(3), 14, -CELL, 0, -CELL, 0);           // snare, beat 4: slides one cell to the left
+edgeMove(B1, beat(4), 14, CELL, 0, 0, -CELL);            // kick, act 2: shrinks into its top-right cell (4,6)
+
+/* ---- The grid of modules (acts 2-4) ----
+   One module per cell.  [column, row].  Born on the beat in the key.        */
+const LOWER_BORN = {
+  4: [[3, 5], [4, 5], [5, 5], [5, 7]],                   // kick of act 2
+  5: [[3, 4], [2, 4]],                                   // snare
+  6: [[1, 4], [5, 4]],                                   // soft kick
+  7: [[0, 5], [0, 7], [1, 7]]                            // snare
+};
+const BIG_FILL = [                                       // kick of act 3: the grid fills (beat 8)
+  [1, 6], [2, 6], [3, 7],
+  [0, 0], [2, 0], [3, 0], [5, 0],
+  [1, 1], [2, 1], [4, 1], [5, 1],
+  [0, 2], [1, 2], [3, 2], [4, 2],
+  [0, 3], [2, 3], [4, 3]
+];
+function kindFor(c, r) { return r === 0 ? 'circle' : r === 1 ? 'tri' : r === 2 ? 'circle' : 'rect'; }
+
+const mods = [];       // every module: { c, r (start cell), cur (row after slides), shape }
+mods.push({ c: 4, r: 6, cur: 6, shape: B1 });
+function addModule(c, r, beatN) {
+  const s = mkShape('m_' + c + '_' + r, kindFor(c, r), cellBox(c, r), RED);
+  bornAt(s, beat(beatN), 13);
+  mods.push({ c: c, r: r, cur: r, shape: s });
+  return s;
+}
+Object.keys(LOWER_BORN).forEach(function (b) { LOWER_BORN[b].forEach(function (cr) { addModule(cr[0], cr[1], +b); }); });
+BIG_FILL.forEach(function (cr) { addModule(cr[0], cr[1], 8); });
+function modAt(c, r) { for (let i = 0; i < mods.length; i++) if (mods[i].c === c && mods[i].r === r) return mods[i]; return null; }
+
+/* ---- Act 3 snare/soft-kick: single modules slide one cell into a free cell of their own column ---- */
+[[1, 4, 1, 9], [3, 5, 1, 9], [0, 5, -1, 10], [5, 5, 1, 10]].forEach(function (x) {
+  const m = modAt(x[0], x[1]);
+  moveBy(m.shape, beat(x[3]), 0, x[2] * CELL);
+  m.cur += x[2];
+});
+
+/* ---- Act 3 hi-hat: straight 16ths.  Sixteenth slots 2..8 of the bar; each module pulses every 4th slot ---- */
+mods.forEach(function (m) {
+  const phase = (m.c + 2 * m.r) % 4;
+  for (let k = 2; k <= 8; k++) {
+    if ((k + phase) % 4 !== 0) continue;
+    const tp = beat(8) + k * BEAT / 4;
+    // do not pulse a module that is busy sliding
+    const sliding = m.shape.moves.some(function (mv) { return tp > mv.hit - 0.5 && tp < mv.hit + 0.4 && mv.hit < beat(11); });
+    if (!sliding) pulseAt(m.shape, tp, 0.12, 0.16);
+  }
+});
+
+/* ---- Act 4 (beats 12-16): the many gather, keeping their gaps ----
+   Each column falls down to rows 3..7 (a block of 5 per column).  We split the fall into two
+   moves (a snare at beat 11 and the kick at beat 12) so no edge ever runs faster than the speed limit.
+   Every module in a column moves down by at least as much as the one below it, so the gaps only ever shrink to the
+   normal 30 px and never touch.                                                                           */
+const LONE_COL = 2, LONE_ROW = 5;       // the module that will become the red circle
+let lone = null;
+for (let c = 0; c < COLS; c++) {
+  const col = mods.filter(function (m) { return m.c === c; }).sort(function (a, b) { return a.cur - b.cur; });
+  col.forEach(function (m, k) {
+    const target = 3 + k, disp = target - m.cur;
+    m.target = target;
+    const d1 = Math.min(disp, 1), d2 = disp - d1;
+    // Same spring for every module in a stage (wn 14 for the snare, 10 for the kick): then neighbours
+    // follow the same curve, so the gap between them changes smoothly and never dips below its final value.
+    if (d1) edgeMove(m.shape, beat(11), 14, 0, d1 * CELL, 0, d1 * CELL);
+    if (d2) edgeMove(m.shape, beat(12), 10, 0, d2 * CELL, 0, d2 * CELL);
+    if (c === LONE_COL && target === LONE_ROW) { m.lone = true; lone = m; }
+  });
+}
+// some modules turn white on the black field (the lone one stays red)
+mods.forEach(function (m) {
+  if (m.lone) return;
+  if (((m.c * 5 + m.r * 3) % 4) < 2) m.shape.recolor = { to: WHITE, t0: 8.05 + 0.04 * m.c, t1: 8.4 + 0.04 * m.c };
+});
+// Act 4 hi-hat: syncopated off-beats [0.5, 1.5, 2.75, 3.5] -> a third of the modules pulse on each
+[0.5, 1.5, 2.75, 3.5].forEach(function (f, k) {
+  const tp = beat(12) + f * BEAT;
+  mods.forEach(function (m) {
+    if (m.lone) return;
+    if (((m.c * 7 + m.r * 3 + k * 5) % 3) === 0) pulseAt(m.shape, tp, 0.12, 0.2);
+  });
+});
+
+// Soft kick of bar 4 (beat 14): the top row of the block breathes, a bit deeper than the hi-hat pulses
+mods.forEach(function (m) { if (m.target === 3) pulseAt(m.shape, beat(14) - 0.08, 0.2, 0.3); });
+
+/* ---- Act 5 (beats 16-20): the many shrink away; one clear shape morphs into the big red circle ----
+   The circle ends as a 4x4-cell block (columns 1-4, rows 4-7).                                       */
+(function () {
+  const foot = [], rest = [];
+  mods.forEach(function (m) {
+    if (m.lone) return;
+    (m.c >= 1 && m.c <= 4 && m.target >= 4 ? foot : rest).push(m);
+  });
+  const d = function (m) { return Math.abs(m.c - LONE_COL) + Math.abs(m.target - LONE_ROW); };
+  foot.sort(function (a, b) { return d(a) - d(b); });
+  // The words of this act sit on the right, so the right-hand leftovers leave first and the left-hand
+  // ones last: that keeps the picture balanced on beat 18 of the score (t = 11.333).
+  rest.sort(function (a, b) { return (b.c >= 3) - (a.c >= 3) || d(a) - d(b); });
+  foot.forEach(function (m, k) { leaveAt(m.shape, 10.42 + 0.03 * k, 0.35); });
+  rest.forEach(function (m, k) { leaveAt(m.shape, 10.95 + 0.03 * k + (m.c < 3 ? 0.15 : 0), 0.35); });
+  // the lone module becomes a 'morph' shape: square -> circle while it grows
+  const s = lone.shape;
+  s.kind = 'morph';
+  const wn = 10, hit = beat(18);                          // lands on the soft kick of bar 5
+  edgeMove(s, hit, wn, -CELL, -CELL, 2 * CELL, 2 * CELL);
+  const st = hit - crossTime(wn);
+  s.morph = { t0: st, t1: hit, snap: st + 13 / wn };
+  pulseAt(s, beat(22) - 0.1, 0.04, 0.3);                  // soft kick of bar 6: the circle breathes (about 20 px)
+  leaveAt(s, beat(23), 0.567, 'alpha');                   // last beat: everything fades to plain white
+})();
+
+/* ---- HI-HAT MARKS (small ticks that blink) ----
+   A mark sits at a cell centre.  Each onset makes it fade in and out over 0.28 s.             */
+const marks = [];
+function mkMark(id, kind, c, r, size, color, onsets) {
+  marks.push({ id: id, kind: kind, cx: gx(c) + CELL / 2, cy: gy(r) + CELL / 2, size: size, color: color, onsets: onsets });
+}
+const MARK_DUR = 0.28;
+// Act 1: straight 8ths, a little black square sweeping across row 4
+(function () {
+  const on = [1, 1.5, 2, 2.5, 3, 3.5].map(beat);
+  for (let c = 0; c < 6; c++) mkMark('hh1_' + c, 'rect', c, 4, 22, INK, [on[c]]);
+})();
+// Act 2: triplets, a little black circle sweeping across row 3 (the empty row under the words)
+(function () {
+  const on = []; for (let j = 1; j <= 8; j++) on.push(beat(4 + j / 3));
+  for (let c = 0; c < 6; c++) mkMark('hh2_' + c, 'circle', c, 3, 22, INK, on.filter(function (_, k) { return k % 6 === c; }));
+})();
+// Act 5: syncopated (0.25, 0.75, 1.5) white ticks along row 0
+(function () {
+  const on = [0.25, 0.75, 1.5].map(function (f) { return beat(16) + f * BEAT; });
+  for (let c = 0; c < 6; c++) mkMark('hh5_' + c, 'line', c, 0, 24, WHITE, on.filter(function (_, k) { return k === c; }));
+})();
+// Act 6: off-beat black ticks that flank the circle
+(function () {
+  const on = [0.5, 1.5, 2.5].map(function (f) { return beat(20) + f * BEAT; });
+  const cells = [[0, 4], [5, 5], [0, 6]];
+  for (let k = 0; k < 3; k++) mkMark('hh6_' + k, 'line', cells[k][0], cells[k][1], 24, INK, [on[k]]);
+})();
+
+function drawMark(mk, t) {
+  for (let i = 0; i < mk.onsets.length; i++) {
+    const u = (t - mk.onsets[i]) / MARK_DUR;
+    if (u <= 0 || u >= 1) continue;
+    const v = Math.sin(Math.PI * u); const k = v * v;     // 0 -> 1 -> 0
+    const s = mk.size * (0.55 + 0.45 * k), a = k;
+    if (mk.kind === 'rect') rect(mk.id, mk.cx - s / 2, mk.cy - s / 2, s, s, mk.color, a);
+    else if (mk.kind === 'circle') circle(mk.id, mk.cx, mk.cy, s / 2, mk.color, a);
+    else line(mk.id, mk.cx, mk.cy - s / 2, mk.cx, mk.cy + s / 2, 4, mk.color, a);
+    return;
+  }
+}
+
+/* ---- WORDS ----
+   A word has a size, a grid row and an x (left ink edge on a grid line).  Its ink is centred in the row.
+   Every word fades in and out (never pops) and holds still for at least 2 beats after it lands.        */
+const words = [
+  // Act 1 and 2: UNUS lands on the snare of bar 1; PRO on the kick of bar 2; OMNIBUS, on the next snare.
+  // The three words sit in rows 0-2; row 3 stays empty so the squares below keep well clear of the comma.
+  { id: 'w_unus',   str: 'UNUS',      size: 136, weight: 'bold',   row: 0, x: gx(0), color: INK,   fin: [0.40, beat(1)],      fout: [4.70, 4.90] },
+  { id: 'w_pro1',   str: 'PRO',       size: 84,  weight: 'bold',   row: 1, x: gx(0), color: RED,   fin: [beat(4) - 0.27, beat(4)], fout: [4.70, 4.90] },
+  { id: 'w_omn1',   str: 'OMNIBUS,',  size: 136, weight: 'bold',   row: 2, x: gx(0), color: INK,   fin: [beat(5) - 0.27, beat(5)], fout: [4.70, 4.90] },
+  // Act 4: OMNES in white on black
+  { id: 'w_omnes',  str: 'OMNES',     size: 136, weight: 'bold',   row: 1, x: gx(0), color: WHITE, fin: [8.40, beat(13)],     fout: [10.05, 10.30] },
+  // Act 5: PRO in white, UNO in red, on the right
+  { id: 'w_pro2',   str: 'PRO',       size: 84,  weight: 'bold',   row: 1, x: gx(3), color: WHITE, fin: [10.40, beat(16)],    fout: [12.05, 12.30] },
+  { id: 'w_uno2',   str: 'UNO',       size: 136, weight: 'bold',   row: 2, x: gx(3), color: RED,   fin: [10.40, beat(16)],    fout: [12.05, 12.30] },
+  // Act 6: the lockup, broken into lines at word boundaries, plus the caption
+  { id: 'w_l1',     str: 'UNUS PRO',  size: 84,  weight: 'bold',   row: 1, x: gx(0), color: INK,   fin: [beat(20), beat(20) + 0.25], fout: [beat(23), 15.90] },
+  { id: 'w_l2',     str: 'OMNIBUS,',  size: 136, weight: 'bold',   row: 2, x: gx(0), color: INK,   fin: [beat(20), beat(20) + 0.25], fout: [beat(23), 15.90] },
+  { id: 'w_l3a',    str: 'OMNES PRO', size: 84,  weight: 'bold',   row: 3, x: gx(0), color: INK,   fin: [beat(20), beat(20) + 0.25], fout: [beat(23), 15.90] },
+  { id: 'w_l3b',    str: 'UNO',       size: 84,  weight: 'bold',   row: 3, x: null,  after: 'w_l3a', color: RED, fin: [beat(20), beat(20) + 0.25], fout: [beat(23), 15.90] },
+  { id: 'w_cap',    str: '90 BPM — 4/4 — 16 S', size: 52, weight: 'normal', row: 0, x: gx(0), color: INK, fin: [beat(21) - 0.33, beat(21) - 0.05], fout: [beat(23), 15.90] }
+];
+// The caption and every word must keep >= 5 % spare width.  If a word would not fit, step down to the next smaller size.
+function fitWords() {
+  words.forEach(function (w) {
+    if (w.fitted) return;
+    let si = SIZES.indexOf(w.size);
+    const avail = LIVE.x1 - (w.x === null ? LIVE.x0 : w.x);
+    while (si > 0 && measure(w.str, SIZES[si], w.weight).w * 1.05 > avail) si--;
+    w.size = SIZES[si];
+    w.fitted = true;
+  });
+}
+function wordPlacement(w) {
+  const m = measure(w.str, w.size, w.weight);
+  let x = w.x;
+  if (x === null) {                                       // placed after another word on the same line, with a clear gap
+    const a = words.filter(function (o) { return o.id === w.after; })[0];
+    x = a.x + measure(a.str, a.size, a.weight).w + Math.round(a.size * 0.4);
+  }
+  const rowTop = gy(w.row);
+  const baseline = rowTop + (CELL - (m.asc + m.desc)) / 2 + m.asc;   // ink centred in its row
+  return { x: x, baseline: baseline };
+}
+function drawWord(w, t) {
+  const a = sm((t - w.fin[0]) / (w.fin[1] - w.fin[0])) * (1 - sm((t - w.fout[0]) / (w.fout[1] - w.fout[0])));
+  if (a <= 0.002) return;
+  const p = wordPlacement(w);
+  text(w.id, w.str, w.size, w.weight, p.x, p.baseline, w.color, a);
+}
+
+/* ---------------------------------------------------------------------
+   4. renderFrame(t): draw one frame and return its records
+   --------------------------------------------------------------------- */
+function renderFrame(t, dry) {
+  DRY = !!dry;
+  rec = [];
+  fitWords();
+  if (!DRY) { ctx.setTransform(view.scale, 0, 0, view.scale, 0, 0); ctx.globalAlpha = 1; }
+  const bg = background(t);
+  field(bg.dark, bg.mode);
+  shapes.forEach(function (s) { drawShape(s, t); });
+  marks.forEach(function (mk) { drawMark(mk, t); });
+  words.forEach(function (w) { drawWord(w, t); });
+  if (!DRY) ctx.globalAlpha = 1;
+  const out = rec;
+  DRY = false;
+  return out;
+}
+
+/* ---------------------------------------------------------------------
+   5. FRAME CHECK
+   --------------------------------------------------------------------- */
+const VALID_TOKENS = new Set(['UNUS', 'PRO', 'OMNIBUS,', 'OMNES', 'UNO', '90', 'BPM', '—', '4/4', '16', 'S']);
+const TOL = 0.01;
+
+// ---- distances between real outlines ----
+function dPtBox(px, py, b) {
+  const dx = Math.max(b.x - px, 0, px - (b.x + b.w)), dy = Math.max(b.y - py, 0, py - (b.y + b.h));
+  return Math.hypot(dx, dy);
+}
+function dBoxBox(a, b) {
+  const dx = Math.max(0, b.x - (a.x + a.w), a.x - (b.x + b.w)), dy = Math.max(0, b.y - (a.y + a.h), a.y - (b.y + b.h));
+  return Math.hypot(dx, dy);
+}
+function dPtSeg(px, py, s) {
+  const vx = s.x2 - s.x1, vy = s.y2 - s.y1, L = vx * vx + vy * vy;
+  let u = L ? ((px - s.x1) * vx + (py - s.y1) * vy) / L : 0; u = Math.max(0, Math.min(1, u));
+  return Math.hypot(px - (s.x1 + u * vx), py - (s.y1 + u * vy));
+}
+function segCross(a, b) {            // do two segments cross?
+  function o(ax, ay, bx, by, cx, cy) { return (bx - ax) * (cy - ay) - (by - ay) * (cx - ax); }
+  const d1 = o(a.x1, a.y1, a.x2, a.y2, b.x1, b.y1), d2 = o(a.x1, a.y1, a.x2, a.y2, b.x2, b.y2);
+  const d3 = o(b.x1, b.y1, b.x2, b.y2, a.x1, a.y1), d4 = o(b.x1, b.y1, b.x2, b.y2, a.x2, a.y2);
+  return (d1 * d2 < 0) && (d3 * d4 < 0);
+}
+function dSegBox(s, b) {
+  if (dPtBox(s.x1, s.y1, b) === 0 || dPtBox(s.x2, s.y2, b) === 0) return 0;
+  const edges = [[b.x, b.y, b.x + b.w, b.y], [b.x + b.w, b.y, b.x + b.w, b.y + b.h], [b.x + b.w, b.y + b.h, b.x, b.y + b.h], [b.x, b.y + b.h, b.x, b.y]];
+  let d = Infinity;
+  for (let i = 0; i < 4; i++) {
+    const e = { x1: edges[i][0], y1: edges[i][1], x2: edges[i][2], y2: edges[i][3] };
+    if (segCross(s, e)) return 0;
+    d = Math.min(d, dPtSeg(e.x1, e.y1, s), dSegSeg(s, e));
+  }
+  return Math.min(d, dPtBox(s.x1, s.y1, b), dPtBox(s.x2, s.y2, b));
+}
+function dSegSeg(a, b) {
+  if (segCross(a, b)) return 0;
+  return Math.min(dPtSeg(a.x1, a.y1, b), dPtSeg(a.x2, a.y2, b), dPtSeg(b.x1, b.y1, a), dPtSeg(b.x2, b.y2, a));
+}
+// empty space between two records (negative = overlap)
+function gapBetween(a, b) {
+  const ca = a.kind === 'circle', cb = b.kind === 'circle', la = a.kind === 'line', lb = b.kind === 'line';
+  if (ca && cb) return Math.hypot(a.cx - b.cx, a.cy - b.cy) - a.r - b.r;
+  if (ca && lb) return dPtSeg(a.cx, a.cy, b) - a.r - b.th / 2;
+  if (la && cb) return dPtSeg(b.cx, b.cy, a) - b.r - a.th / 2;
+  if (ca) return dPtBox(a.cx, a.cy, b) - a.r;
+  if (cb) return dPtBox(b.cx, b.cy, a) - b.r;
+  if (la && lb) return dSegSeg(a, b) - a.th / 2 - b.th / 2;
+  if (la) return dSegBox(a, b) - a.th / 2;
+  if (lb) return dSegBox(b, a) - b.th / 2;
+  return dBoxBox(a, b);
+}
+
+// ---- is a resting shape exactly on the grid? ----
+function near(v, step) { const k = Math.round(v / step); return Math.abs(v - k * step) <= 0.1; }
+function onGrid(r) {
+  if (r.kind === 'line') {
+    if (r.w <= 34 + 4 && r.h <= 34 + 4 && (Math.max(r.w, r.h) <= 34)) {      // small tick: centred on a cell centre / crossing
+      return near((r.x + r.w / 2) - MARGIN, CELL / 2) && near((r.y + r.h / 2) - MARGIN, CELL / 2);
+    }
+    if (r.x1 === r.x2) return near(r.x1 - MARGIN, CELL / 2);                 // vertical: on a grid line or a cell centre line
+    return near(r.y1 - MARGIN, CELL / 2);
+  }
+  if (r.w <= 34 && r.h <= 34) return near((r.x + r.w / 2) - MARGIN, CELL / 2) && near((r.y + r.h / 2) - MARGIN, CELL / 2);
+  const u = (r.x - MARGIN - INSET) / CELL, v = (r.y - MARGIN - INSET) / CELL;
+  const wc = (r.w + 2 * INSET) / CELL, hc = (r.h + 2 * INSET) / CELL;
+  const isInt = x => Math.abs(x - Math.round(x)) * CELL <= 0.1;
+  return isInt(u) && isInt(v) && isInt(wc) && isInt(hc) && Math.round(wc) >= 1 && Math.round(hc) >= 1 &&
+         Math.round(u) >= 0 && Math.round(v) >= 0 && Math.round(u) + Math.round(wc) <= COLS && Math.round(v) + Math.round(hc) <= ROWS;
+}
+
+// area of a record on the left and right half of the frame (for the balance rule)
+function halfAreas(r) {
+  if (r.kind === 'circle') {
+    const seg = (cx, rad, x) => {                      // area of the circle that lies left of x
+      const d = Math.max(-rad, Math.min(rad, x - cx));
+      return rad * rad * Math.acos(-d / rad) - d * Math.sqrt(Math.max(0, rad * rad - d * d));
+    };
+    const left = seg(r.cx, r.r, W / 2), total = Math.PI * r.r * r.r;
+    return [left, total - left];
+  }
+  const w = Math.max(r.w, 0), h = Math.max(r.h, 0);
+  const l = Math.max(0, Math.min(r.x + w, W / 2) - Math.max(r.x, 0)), rr = Math.max(0, Math.min(r.x + w, W) - Math.max(r.x, W / 2));
+  return [l * h, rr * h];
+}
+
+/* The checker is fed one frame after another and remembers only what it needs
+   (the previous frame and how long each box has been unchanged).                */
+function Checker() { this.prev = null; this.hist = new Map(); this.i = -1; }
+Checker.prototype.step = function (recs, t, wantBeat) {
+  const P = [];
+  const add = (rule, ids, msg) => P.push({ t: Math.round(t * 1000) / 1000, rule: rule, ids: ids, msg: msg });
+  const items = recs.filter(r => r.kind !== 'field');
+  const prevMap = new Map(); if (this.prev) this.prev.forEach(r => prevMap.set(r.id, r));
+  this.i++;
+
+  // --- words ---
+  items.forEach(r => {
+    if (r.kind !== 'text') return;
+    if (r.x < LIVE.x0 - TOL || r.y < LIVE.y0 - TOL || r.x + r.w > LIVE.x1 + TOL || r.y + r.h > LIVE.y1 + TOL)
+      add('word-outside-live-area', [r.id], r.text);
+    if (r.w * 1.05 > LIVE.x1 - LIVE.x0) add('word-spare-width', [r.id], r.text + ' ' + r.w.toFixed(0) + ' px');
+    if (/OMNIBUS(?!,)/.test(r.text)) add('omnibus-without-comma', [r.id], r.text);
+    r.text.split(' ').forEach(tok => { if (!VALID_TOKENS.has(tok)) add('cut-word', [r.id], tok); });
+  });
+
+  // --- spacing between real outlines ---
+  for (let a = 0; a < items.length; a++) for (let b = a + 1; b < items.length; b++) {
+    const g = gapBetween(items[a], items[b]);
+    if (g < MIN_GAP) add('spacing', [items[a].id, items[b].id], g.toFixed(1) + ' px');
+  }
+
+  // --- history of boxes: resting shapes / words ---
+  items.forEach(r => {
+    const h = this.hist.get(r.id), last = h && h.t === this.i - 1 ? h : null;
+    let run = 0;
+    if (last && Math.abs(last.x - r.x) <= TOL && Math.abs(last.y - r.y) <= TOL && Math.abs(last.w - r.w) <= TOL && Math.abs(last.h - r.h) <= TOL) run = last.run + 1;
+    this.hist.set(r.id, { t: this.i, x: r.x, y: r.y, w: r.w, h: r.h, run: run });
+    if (run >= 6) {
+      if (r.kind === 'text') {
+        if (SIZES.indexOf(r.size) < 0) add('word-size', [r.id], r.size + ' px');
+      } else if (!onGrid(r)) add('resting-shape-off-grid', [r.id], r.x.toFixed(2) + ',' + r.y.toFixed(2) + ' ' + r.w.toFixed(2) + 'x' + r.h.toFixed(2));
+    }
+    if (r.kind === 'text' && r.color === RED && r.size < 84) add('red-text-too-small', [r.id], r.size + ' px');
+    // frame edge
+    const fullW = r.kind === 'line' && Math.min(r.x1, r.x2) <= 0 && Math.max(r.x1, r.x2) >= W && r.y1 === r.y2;
+    const fullH = r.kind === 'line' && Math.min(r.y1, r.y2) <= 0 && Math.max(r.y1, r.y2) >= H && r.x1 === r.x2;
+    if (!fullW && !fullH && (r.x <= 0 || r.y <= 0 || r.x + r.w >= W || r.y + r.h >= H)) add('touches-frame-edge', [r.id], '');
+  });
+
+  // --- frame to frame ---
+  if (this.prev) {
+    items.forEach(r => {
+      const p = prevMap.get(r.id);
+      if (p) {
+        const dd = Math.max(Math.abs(r.x - p.x), Math.abs(r.y - p.y), Math.abs((r.x + r.w) - (p.x + p.w)), Math.abs((r.y + r.h) - (p.y + p.h)));
+        if (dd > MAX_STEP) add('too-fast', [r.id], dd.toFixed(1) + ' px/frame');
+      } else if (r.alpha > 0.25 && r.w > MIN_GAP && r.h > MIN_GAP) add('pops-in', [r.id], 'alpha ' + r.alpha.toFixed(2));
+    });
+    this.prev.forEach(p => {
+      if (p.kind === 'field') return;
+      if (!items.some(r => r.id === p.id) && p.alpha > 0.25 && p.w > MIN_GAP && p.h > MIN_GAP) add('pops-out', [p.id], 'alpha ' + p.alpha.toFixed(2));
+    });
+  }
+
+  // --- balance on every beat (skip plain white frames) ---
+  if (wantBeat) {
+    let L = 0, R = 0;
+    items.forEach(r => { const a = halfAreas(r); L += a[0] * r.alpha; R += a[1] * r.alpha; });
+    if (L + R > 2000) {
+      if (L / (L + R) < 0.3 || R / (L + R) < 0.3) add('balance', [], 'left ' + Math.round(100 * L / (L + R)) + '% right ' + Math.round(100 * R / (L + R)) + '%');
+    }
+  }
+  this.prev = recs;
+  return P;
+};
+
+// Full check: t = 0 .. 16 in steps of 1/60 s
+function frameCheck() {
+  const keep = playClock.shown;
+  const all = [];
+  const ck = new Checker();
+  let lastDark = null, run = 0, runStart = 0, runWords = false, runFirstWordT = null;
+  const frames = 960;
+  const finishRun = (i) => {
+    if (run > 0 && run < 40) all.push({ t: runStart / 60, rule: 'background-change-too-short', ids: ['field'], msg: run + ' frames' });
+    run = 0;
+  };
+  for (let i = 0; i <= frames; i++) {
+    const t = i / 60;
+    const recs = renderFrame(t, false);
+    const isBeat = (i % 40 === 0);
+    ck.step(recs, t, isBeat).forEach(p => all.push(p));
+    const f = recs[0];
+    if (lastDark !== null) {
+      const d = Math.abs(f.dark - lastDark);
+      if (d > 1e-9) {
+        if (run === 0) runStart = i;
+        run++;
+        if (d > 0.05 + 1e-9) all.push({ t: t, rule: 'background-too-fast', ids: ['field'], msg: (d * 100).toFixed(2) + '% per frame' });
+      } else if (run) finishRun(i);
+    }
+    // words on screen while the background is changing (this frame, or the frame before it started)
+    const changing = lastDark !== null && Math.abs(f.dark - lastDark) > 1e-9;
+    if (changing) recs.forEach(r => { if (r.kind === 'text') all.push({ t: t, rule: 'word-during-background-change', ids: [r.id], msg: '' }); });
+    lastDark = f.dark;
+    // > 200 shapes
+    const n = recs.filter(r => r.kind !== 'field').length;
+    if (n > 200) all.push({ t: t, rule: 'too-many-shapes', ids: [], msg: n + ' shapes' });
+  }
+  finishRun(frames);
+  // put the screen back as it was
+  renderFrame(keep, false);
+  all.sort((a, b) => a.t - b.t);
+  const groups = {};
+  all.forEach(p => { const k = p.rule + ' ' + p.ids.join('+'); groups[k] = (groups[k] || 0) + 1; });
+  Object.defineProperty(all, 'groups', { value: groups, enumerable: false });
+  return all;
+}
+window.frameCheck = frameCheck;
+
+/* F view: outline every recorded thing, green if fine, red if it breaks a rule on this frame */
+function drawFrameCheckView(t) {
+  const ck = new Checker();
+  let problems = [], recs = null;
+  const i0 = Math.max(0, Math.round(t * 60) - 8);
+  for (let i = i0; i <= Math.round(t * 60); i++) { recs = renderFrame(i / 60, true); problems = ck.step(recs, i / 60, false); }
+  const bad = new Set(); problems.forEach(p => p.ids.forEach(id => bad.add(id)));
+  ctx.setTransform(view.scale, 0, 0, view.scale, 0, 0);
+  ctx.globalAlpha = 1; ctx.lineWidth = 3;
+  recs.forEach(r => {
+    if (r.kind === 'field') return;
+    ctx.strokeStyle = bad.has(r.id) ? '#ff1744' : '#00c853';
+    if (r.kind === 'circle') { ctx.beginPath(); ctx.arc(r.cx, r.cy, r.r, 0, Math.PI * 2); ctx.stroke(); }
+    else if (r.kind === 'line') { ctx.beginPath(); ctx.moveTo(r.x1, r.y1); ctx.lineTo(r.x2, r.y2); ctx.lineWidth = Math.max(3, r.th); ctx.stroke(); ctx.lineWidth = 3; }
+    else ctx.strokeRect(r.x, r.y, r.w, r.h);
+  });
+}
+
+/* ---------------------------------------------------------------------
+   6. PLAYBACK, KEYS, TAP BUTTONS, METRONOME
+   --------------------------------------------------------------------- */
+const view = { scale: 1 };
+const playClock = { playing: true, base: 0, wall0: 0, shown: 0 };
+let showDbg = false, showCheck = false, uiShownAt = -1e9;
+
+function wrap(t) { t = t % LOOP; return t < 0 ? t + LOOP : t; }
+function nowT() {
+  if (!playClock.playing) return playClock.base;
+  return wrap(playClock.base + (performance.now() - playClock.wall0) / 1000);
+}
+function paint(t) {
+  playClock.shown = t;
+  const recs = renderFrame(t, false);
+  if (showCheck) drawFrameCheckView(t);
+  if (showDbg) {
+    const bar = Math.floor(t / BAR) + 1, b = Math.floor((t % BAR) / BEAT) + 1, sub = Math.floor(((t % BEAT) / BEAT) * 4) + 1;
+    dbg.textContent = 'bar ' + bar + '.' + b + '.' + sub + '   t=' + t.toFixed(3);
+  }
+  return recs;
+}
+/* window.seek(t): draw frame t, move the playback clock there, return the records of that frame. */
+function seek(t) {
+  t = wrap(t);
+  playClock.base = t; playClock.wall0 = performance.now();
+  audio.last = t;                                      // a seek never triggers drum hits
+  return paint(t);
+}
+window.seek = seek;
+
+const dbg = document.getElementById('dbg');
+function resize() {
+  const s = Math.min(window.innerWidth / W, window.innerHeight / H);
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);               // pixel density capped at 2
+  canvas.style.width = Math.round(W * s) + 'px';
+  canvas.style.height = Math.round(H * s) + 'px';
+  canvas.width = Math.round(W * s * dpr);
+  canvas.height = Math.round(H * s * dpr);
+  view.scale = canvas.width / W;
+  paint(playClock.shown);
+}
+window.addEventListener('resize', resize);
+
+function togglePlay() {
+  if (playClock.playing) { playClock.base = nowT(); playClock.playing = false; }
+  else { playClock.playing = true; playClock.wall0 = performance.now(); }
+  syncButtons();
+}
+function stepBeat(dir) {
+  const t = nowT();
+  const n = dir > 0 ? Math.floor(t / BEAT + 1e-6) + 1 : Math.ceil(t / BEAT - 1e-6) - 1;
+  seek(n * BEAT);
+}
+function toggleD() { showDbg = !showDbg; dbg.style.display = showDbg ? 'block' : 'none'; paint(playClock.shown); syncButtons(); }
+function toggleF() { showCheck = !showCheck; paint(playClock.shown); syncButtons(); }
+function toggleM() { audio.on = !audio.on; if (audio.on) audio.init(); audio.last = nowT(); syncButtons(); }
+
+window.addEventListener('keydown', function (e) {
+  if (e.code === 'Space') { e.preventDefault(); togglePlay(); }
+  else if (e.code === 'ArrowLeft') { e.preventDefault(); stepBeat(-1); }
+  else if (e.code === 'ArrowRight') { e.preventDefault(); stepBeat(1); }
+  else if (e.code === 'KeyD') toggleD();
+  else if (e.code === 'KeyM') toggleM();
+  else if (e.code === 'KeyF') toggleF();
+});
+
+/* tap buttons: shown for 3 s after a tap, then fade out.  Opacity is computed from the clock every frame. */
+const bar = document.getElementById('bar');
+const btn = id => document.getElementById(id);
+function syncButtons() {
+  btn('bD').className = showDbg ? 'on' : ''; btn('bM').className = audio.on ? 'on' : ''; btn('bF').className = showCheck ? 'on' : '';
+}
+function bindButton(id, fn) {
+  btn(id).addEventListener('click', function (e) { e.stopPropagation(); uiShownAt = performance.now(); fn(); });
+}
+bindButton('bPlay', togglePlay); bindButton('bPrev', function () { stepBeat(-1); }); bindButton('bNext', function () { stepBeat(1); });
+bindButton('bD', toggleD); bindButton('bM', toggleM); bindButton('bF', toggleF);
+document.body.addEventListener('pointerdown', function (e) { if (!bar.contains(e.target)) uiShownAt = performance.now(); });
+function updateBar(now) {
+  const age = (now - uiShownAt) / 1000;
+  const o = age < 2.5 ? 1 : age < 3 ? 1 - (age - 2.5) / 0.5 : 0;
+  bar.style.opacity = o.toFixed(3);
+  bar.style.pointerEvents = o > 0.05 ? 'auto' : 'none';
+}
+
+/* ---- drum metronome (Web Audio), off by default ----
+   kick on beat 1, soft kick on beat 3 (this picture uses one in every bar), snare on 2 and 4,
+   closed hi-hat on the pattern the current act uses.                                          */
+const HAT = [
+  [0, .5, 1, 1.5, 2, 2.5, 3, 3.5],                                        // act 1: straight 8ths
+  [0, 1/3, 2/3, 1, 4/3, 5/3, 2, 7/3, 8/3, 3, 10/3, 11/3],                 // act 2: triplets
+  [0, .25, .5, .75, 1, 1.25, 1.5, 1.75, 2, 2.25, 2.5, 2.75, 3, 3.25, 3.5, 3.75],   // act 3: 16ths
+  [0.5, 1.5, 2.75, 3.5],                                                  // act 4: syncopated
+  [0.25, 0.75, 1.5, 2.25],                                                // act 5: syncopated, different
+  [0.5, 1.5, 2.5]                                                         // act 6: sparse off-beats
+];
+const drumEvents = [];
+for (let n = 0; n < 24; n++) {
+  const k = n % 4;
+  drumEvents.push({ t: beat(n), type: k === 0 ? 'kick' : k === 2 ? 'kick2' : 'snare' });
+}
+HAT.forEach(function (p, a) { p.forEach(function (f) { drumEvents.push({ t: beat(a * 4) + f * BEAT, type: 'hat' }); }); });
+drumEvents.sort(function (a, b) { return a.t - b.t; });
+
+const audio = {
+  on: false, ac: null, noise: null, last: 0,
+  init: function () {
+    if (this.ac) { if (this.ac.state === 'suspended') this.ac.resume(); return; }
+    const AC = window.AudioContext || window.webkitAudioContext; if (!AC) return;
+    this.ac = new AC();
+    const len = this.ac.sampleRate * 0.5, buf = this.ac.createBuffer(1, len, this.ac.sampleRate), d = buf.getChannelData(0);
+    let seed = 12345;                                   // fixed seed: the noise is the same every time
+    for (let i = 0; i < len; i++) { seed = (seed * 1664525 + 1013904223) >>> 0; d[i] = (seed / 4294967296) * 2 - 1; }
+    this.noise = buf;
+  },
+  play: function (type) {
+    const ac = this.ac; if (!ac) return;
+    const t0 = ac.currentTime, g = ac.createGain(); g.connect(ac.destination);
+    if (type === 'kick' || type === 'kick2') {
+      const o = ac.createOscillator(); o.type = 'sine';
+      o.frequency.setValueAtTime(150, t0); o.frequency.exponentialRampToValueAtTime(45, t0 + 0.12);
+      g.gain.setValueAtTime(type === 'kick' ? 0.9 : 0.5, t0); g.gain.exponentialRampToValueAtTime(0.001, t0 + 0.28);
+      o.connect(g); o.start(t0); o.stop(t0 + 0.3);
+    } else {
+      const s = ac.createBufferSource(); s.buffer = this.noise;
+      const f = ac.createBiquadFilter();
+      if (type === 'snare') { f.type = 'bandpass'; f.frequency.value = 1800; g.gain.setValueAtTime(0.55, t0); g.gain.exponentialRampToValueAtTime(0.001, t0 + 0.16); }
+      else { f.type = 'highpass'; f.frequency.value = 7000; g.gain.setValueAtTime(0.22, t0); g.gain.exponentialRampToValueAtTime(0.001, t0 + 0.04); }
+      s.connect(f); f.connect(g); s.start(t0); s.stop(t0 + 0.2);
+    }
+  },
+  // play every hit that happened since the last frame
+  tick: function (t) {
+    if (this.on && this.ac && playClock.playing) {
+      const a = this.last, b = t;
+      if (b >= a && b - a < 0.25) this.hits(a, b);
+      else if (b < a && a - b > LOOP - 0.25) { this.hits(a, LOOP + 1e-9); this.hits(-1e-9, b); }   // the loop wrapped
+    }
+    this.last = t;
+  },
+  hits: function (a, b) { for (let i = 0; i < drumEvents.length; i++) { const e = drumEvents[i]; if (e.t > a && e.t <= b) this.play(e.type); } }
+};
+
+function loop(now) {
+  const t = nowT();
+  audio.tick(t);
+  paint(t);
+  updateBar(now);
+  requestAnimationFrame(loop);
+}
+
+// start
+playClock.wall0 = performance.now();
+resize();
+requestAnimationFrame(loop);
+
+})();
+</script>
+</body>
+</html>
