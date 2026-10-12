@@ -1,0 +1,681 @@
+<!doctype html>
+<html lang="la">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Unus</title>
+<style>
+  /* The page is black; the canvas (the "frame") sits centred on it. */
+  html, body { margin: 0; height: 100%; background: #000000; overflow: hidden; }
+  body { display: flex; align-items: center; justify-content: center; }
+  canvas { display: block; }
+  /* Small debug read-out for key D. It is HTML, not part of the picture. */
+  #dbg { position: fixed; left: 8px; top: 8px; display: none; pointer-events: none;
+         font: 12px/1.3 monospace; color: #0f0; background: #000; padding: 4px 6px; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="dbg"></div>
+<script>
+'use strict';
+/* =====================================================================
+   UNUS PRO OMNIBUS, OMNES PRO UNO
+   A 16-second loop at 90 BPM. Everything you see is a pure function of
+   the time t (in seconds, 0..16). window.seek(t) draws the frame at t.
+
+   The file is organised in three stages:
+     1. grid, drawing helpers and the built-in frame check
+     2. the six acts (one per bar)
+     3. rhythm: hi-hat marks, and the drum metronome (key M)
+   ===================================================================== */
+
+/* ---------------------------------------------------------------------
+   STAGE 1a: constants
+   --------------------------------------------------------------------- */
+const W = 1080, H = 1350;          // frame size in "frame pixels"
+const CELL = 135;                  // one grid cell is a 135 px square
+const LIVE = { x0: 135, y0: 135, x1: 945, y1: 1215 };  // the box inside the margins
+const MID = W / 2;                 // the line between left and right half
+
+const BEAT = 2 / 3;                // 90 BPM: one beat lasts 2/3 of a second
+const BAR = 4 * BEAT;              // 4/4: one bar = 8/3 s
+const LOOP = 16;                   // 6 bars
+const CUTS = [8, 40 / 3];          // the two hard cuts (beat 1 of act 4 and act 6)
+
+const WHITE = '#ffffff', BLACK = '#111111', RED = '#e30613';
+const FONT = '"Helvetica Neue", Helvetica, Arial, sans-serif';
+const SIZES = [52, 84, 136];       // the only three text sizes (each x 1.618)
+const RULE = 8;                    // thickness of the thin rules
+
+// Grid helpers: column c (0..5) and row r (0..7) to frame pixels.
+const gx = c => LIVE.x0 + c * CELL;
+const gy = r => LIVE.y0 + r * CELL;
+// Time of a beat: bar 0..5, beat 0..3 (0 is "beat 1", the downbeat).
+const hit = (bar, beat) => bar * BAR + beat * BEAT;
+
+/* ---------------------------------------------------------------------
+   STAGE 1b: motion curves (all are pure functions of t)
+   --------------------------------------------------------------------- */
+const clamp01 = x => (x < 0 ? 0 : x > 1 ? 1 : x);
+const lerp = (a, b, k) => a + (b - a) * k;
+// Smooth 0..1 ramp that eases in and out (no overshoot).
+const smooth = x => { x = clamp01(x); return x * x * x * (x * (x * 6 - 15) + 10); };
+
+/* A damped spring. It starts at rest `lead` seconds before the hit, reaches
+   the target exactly ON the hit, overshoots a little and settles.
+   z is the damping: 0.62 gives about 8% overshoot, 0.75 about 3%.
+   Returns 0 before the move and ~1 after; use it as lerp(from, to, k). */
+function spring(t, hitTime, lead, z) {
+  z = z || 0.62;
+  const tau = t - (hitTime - lead);
+  if (tau <= 0) return 0;
+  const wd = (Math.PI - Math.acos(z)) / lead;   // chosen so x(lead) = 1 exactly
+  const w = wd / Math.sqrt(1 - z * z);
+  const a = z * w;
+  return 1 - Math.exp(-a * tau) * (Math.cos(wd * tau) + (a / wd) * Math.sin(wd * tau));
+}
+const LK = 0.40;   // lead time of a kick move
+const LS = 0.25;   // lead time of a snare move
+const LR = 0.36;   // lead time of a rule that grows across the live area
+const LW = 0.30;   // lead time of a word sliding in
+const ZW = 0.75;   // words land with a softer spring (about 3% overshoot)
+
+/* ---------------------------------------------------------------------
+   STAGE 1c: drawing helpers that also RECORD what they drew.
+   Every helper takes a short id. The list LIST holds, for this frame:
+   id, kind, box (x, y, w, h), text size, colour, and the inked area.
+   With DRY = true nothing is painted, only recorded (used by frameCheck).
+   --------------------------------------------------------------------- */
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+let LIST = [];
+let DRY = false;
+let ALPHA = 1;            // opacity used by the helpers (for the final fade)
+
+function record(o) { LIST.push(o); }
+
+// A filled rectangle. kind is 'rect' (default), 'field' or 'rule'.
+function rect(id, x, y, w, h, col, kind) {
+  if (w <= 0.01 || h <= 0.01 || ALPHA <= 0.001) return;
+  record({ id, kind: kind || 'rect', x, y, w, h, col, fill: 1 });
+  if (!DRY) { ctx.globalAlpha = ALPHA; ctx.fillStyle = col; ctx.fillRect(x, y, w, h); }
+}
+// A flat full-frame background field.
+function field(id, col) { rect(id, 0, 0, W, H, col, 'field'); }
+// A thin horizontal rule from x0 to x1, centred on y.
+function rule(id, x0, x1, y, col) { rect(id, x0, y - RULE / 2, x1 - x0, RULE, col, 'rule'); }
+// A filled circle.
+function circle(id, cx, cy, r, col) {
+  if (r <= 0.01 || ALPHA <= 0.001) return;
+  record({ id, kind: 'circle', x: cx - r, y: cy - r, w: 2 * r, h: 2 * r, col, fill: Math.PI / 4 });
+  if (!DRY) {
+    ctx.globalAlpha = ALPHA; ctx.fillStyle = col;
+    ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI * 2); ctx.fill();
+  }
+}
+// A rounded rectangle path (used by the act 5 morph). r is the corner radius.
+function roundRect(id, x, y, w, h, r, col) {
+  if (w <= 0.01 || h <= 0.01 || ALPHA <= 0.001) return;
+  r = Math.min(r, w / 2, h / 2);                 // never let the corners cross
+  record({ id, kind: 'path', x, y, w, h, col, fill: 1 - (4 - Math.PI) * r * r / (w * h) });
+  if (!DRY) {
+    ctx.globalAlpha = ALPHA; ctx.fillStyle = col;
+    ctx.beginPath();
+    ctx.moveTo(x + r, y);
+    ctx.arcTo(x + w, y, x + w, y + h, r);
+    ctx.arcTo(x + w, y + h, x, y + h, r);
+    ctx.arcTo(x, y + h, x, y, r);
+    ctx.arcTo(x, y, x + w, y, r);
+    ctx.closePath(); ctx.fill();
+  }
+}
+// Text: one whole word (or the caption). x is the left edge, base the baseline.
+const measureCache = new Map();
+function fontOf(size, weight) { return weight + ' ' + size + 'px ' + FONT; }
+function measure(str, size, weight) {
+  const key = weight + '|' + size + '|' + str;
+  let m = measureCache.get(key);
+  if (!m) {
+    ctx.font = fontOf(size, weight);
+    const mt = ctx.measureText(str);
+    m = { w: mt.width,
+          left: Math.max(0, mt.actualBoundingBoxLeft || 0),
+          right: Math.max(mt.width, mt.actualBoundingBoxRight || 0),
+          asc: mt.actualBoundingBoxAscent || size * 0.72,
+          desc: mt.actualBoundingBoxDescent || 0 };
+    measureCache.set(key, m);
+  }
+  return m;
+}
+function text(id, str, x, base, size, weight, col) {
+  if (ALPHA <= 0.001) return;
+  const m = measure(str, size, weight);
+  record({ id, kind: 'text', text: str, size, col,
+           x: x - m.left, y: base - m.asc, w: m.right + m.left, h: m.asc + m.desc, fill: 1 });
+  if (!DRY) {
+    ctx.globalAlpha = ALPHA; ctx.fillStyle = col; ctx.font = fontOf(size, weight);
+    ctx.textBaseline = 'alphabetic'; ctx.textAlign = 'left';
+    ctx.fillText(str, x, base);
+  }
+}
+/* Pick the largest allowed size (not above `pref`) at which `str` fits in
+   `avail` pixels with at least 5% spare width. Red text never goes below 84. */
+function fitSize(str, weight, avail, pref, minSize) {
+  for (const s of SIZES.slice().reverse()) {
+    if (s > pref || s < (minSize || 52)) continue;
+    if (measure(str, s, weight).w * 1.05 <= avail) return s;
+  }
+  return minSize || 52;
+}
+
+/* ---------------------------------------------------------------------
+   STAGE 1d: the frame check. These are exactly the rules of the brief.
+   --------------------------------------------------------------------- */
+const WORDS_OK = ['UNUS', 'PRO', 'OMNIBUS,', 'OMNES', 'UNO', '90 BPM — 4/4 — 16 S'];
+const EPS = 0.5;   // half a pixel of rounding tolerance
+const overlap = (a, b) => a.x < b.x + b.w - EPS && b.x < a.x + a.w - EPS &&
+                          a.y < b.y + b.h - EPS && b.y < a.y + a.h - EPS;
+
+// Rules that can be judged on one frame alone. Returns [{t, rule, id, msg}].
+function checkFrame(list, t) {
+  const out = [];
+  const bad = (rule, id, msg) => out.push({ t: +t.toFixed(4), rule, id, msg });
+  const words = list.filter(e => e.kind === 'text');
+  if (list.length > 200) bad('count', '*', list.length + ' shapes');
+  for (const e of words) {
+    if (e.x < LIVE.x0 - EPS || e.y < LIVE.y0 - EPS ||
+        e.x + e.w > LIVE.x1 + EPS || e.y + e.h > LIVE.y1 + EPS) bad('live', e.id, 'word outside live area');
+    if (!WORDS_OK.includes(e.text)) bad('cut', e.id, 'cut or unknown word "' + e.text + '"');
+    if (!SIZES.includes(e.size)) bad('size', e.id, 'text size ' + e.size);
+    if (e.col === RED && e.size < 84) bad('red', e.id, 'red text below 84');
+  }
+  for (let i = 0; i < words.length; i++)
+    for (let j = i + 1; j < words.length; j++)
+      if (overlap(words[i], words[j])) bad('overlap', words[i].id + '/' + words[j].id, 'words overlap');
+  for (const e of list) {
+    if (e.kind === 'text' || e.kind === 'field') continue;
+    for (const w of words) if (overlap(e, w)) bad('cross', e.id + '/' + w.id, 'shape crosses a word');
+    const touches = e.x <= EPS || e.y <= EPS || e.x + e.w >= W - EPS || e.y + e.h >= H - EPS;
+    const fullRule = e.kind === 'rule' &&
+      ((e.x <= EPS && e.x + e.w >= W - EPS) || (e.y <= EPS && e.y + e.h >= H - EPS));
+    if (touches && !fullRule) bad('edge', e.id, 'touches the frame edge');
+  }
+  return out;
+}
+// Balance: at least 30% of the inked area in each half. Fields don't count.
+function checkBalance(list, t) {
+  let L = 0, R = 0;
+  for (const e of list) {
+    if (e.kind === 'field') continue;
+    const l = Math.max(0, Math.min(e.x + e.w, MID) - e.x);   // width left of the middle
+    const r = Math.max(0, e.x + e.w - Math.max(e.x, MID));   // width right of it
+    L += l * e.h * e.fill; R += r * e.h * e.fill;
+  }
+  if (L + R < 1) return [];                                  // plain frame: skip
+  const share = Math.min(L, R) / (L + R);
+  return share < 0.3 ? [{ t: +t.toFixed(4), rule: 'balance', id: '*',
+                          msg: 'balance ' + Math.round(100 * L / (L + R)) + '% left' }] : [];
+}
+// Jumps: the same id may not move any edge more than 68 px in 1/60 s.
+function checkJumps(prev, list, ta, tb) {
+  if (CUTS.some(c => ta < c - 1e-9 && tb >= c - 1e-9)) return [];
+  const out = [], before = new Map(prev.map(e => [e.id, e]));
+  for (const e of list) {
+    const p = before.get(e.id);
+    if (!p) continue;
+    const d = Math.max(Math.abs(e.x - p.x), Math.abs(e.y - p.y),
+                       Math.abs(e.x + e.w - p.x - p.w), Math.abs(e.y + e.h - p.y - p.h));
+    if (d > 68) out.push({ t: +tb.toFixed(4), rule: 'jump', id: e.id, msg: 'jumped ' + d.toFixed(1) + ' px' });
+  }
+  return out;
+}
+// Steps t from 0 to 16 in 1/60 s and returns every problem with its time.
+window.frameCheck = function () {
+  const out = [];
+  let prev = null;
+  for (let k = 0; k <= 960; k++) {
+    const t = k / 60;
+    const list = scene(t, true);
+    out.push(...checkFrame(list, t));
+    if (prev) out.push(...checkJumps(prev, list, (k - 1) / 60, t));
+    prev = list;
+  }
+  for (let b = 0; b < 24; b++) { const t = b * BEAT; out.push(...checkBalance(scene(t, true), t)); }
+  return out;
+};
+
+/* ---------------------------------------------------------------------
+   STAGE 2: the six acts
+   --------------------------------------------------------------------- */
+const A = [0, 1, 2, 3, 4, 5].map(i => i * BAR);  // start time of each act
+
+/* ---- Act 1: the red square S ---------------------------------------- */
+// S grows in from nothing at t = 0 and lands late (at 0.35 s).
+// On beat 4 it drops one cell and comes to rest on the rule.
+function sState(t) {
+  const size = 270 * spring(t, 0.35, 0.35);
+  return { x: gx(4), y: gy(2) + CELL * spring(t, hit(0, 3), LS), size };
+}
+
+/* ---- Act 2: the eight red copies ------------------------------------ */
+// Each copy starts as one quarter of S and flies to its own cell.
+const QOFF = [[-1, -1], [1, -1], [-1, 1], [1, 1], [-1, -1], [1, -1], [1, 1], [-1, 1]];
+const T2 = [[0, 0], [5, 0], [1, 3], [4, 3], [2, 1], [4, 1], [5, 3], [3, 0]];
+const SPLIT = A[1] - LK;            // the moment S hands over to its copies
+function copyState(j, t) {
+  const s = sState(t);
+  const k = spring(t, A[1], LK);
+  let x = lerp(s.x + QOFF[j][0] * 67.5, gx(T2[j][0]) + 67.5, k);
+  let y = lerp(s.y + QOFF[j][1] * 67.5, gy(T2[j][1]) + 67.5, k);
+  if (j === 2) x += CELL * spring(t, hit(1, 3), LS);   // snare, beat 4: one cell right
+  return { x, y, size: lerp(135, 101, k) };
+}
+
+/* ---- Act 3: many modules (96) --------------------------------------- */
+// Each grid cell of rows 0..3 holds a 2 x 2 group of small modules, so the
+// modules sit on a 12 x 8 half-cell grid ("slots"). Each slot is filled by
+// a module that flies out of the nearest red copy.
+const MODS = [];
+(function buildModules() {
+  const parents = T2.map(([c, r], j) => [gx(c + (j === 2 ? 1 : 0)) + 67.5, gy(r) + 67.5]);
+  const pairs = [];
+  for (let sr = 0; sr < 8; sr++) for (let sc = 0; sc < 12; sc++) {
+    const x = slotX(sc), y = slotY(sr);
+    parents.forEach(([px, py], j) => pairs.push({ sc, sr, j, d: Math.hypot(x - px, y - py) + j * 1e-6 }));
+  }
+  pairs.sort((a, b) => a.d - b.d);
+  const used = new Set(), load = new Array(8).fill(0), red = new Array(8).fill(false);
+  for (const p of pairs) {                     // greedy: nearest first, 12 per parent
+    const key = p.sc + ',' + p.sr;
+    if (used.has(key) || load[p.j] >= 12) continue;
+    used.add(key); load[p.j]++;
+    const isRed = !red[p.j]; red[p.j] = true;  // the closest slot keeps the red copy itself
+    MODS.push({ sc: p.sc, sr: p.sr, parent: p.j, red: isRed });
+  }
+})();
+function slotX(sc) { return LIVE.x0 + 33.75 + 67.5 * sc; }
+function slotY(sr) { return LIVE.y0 + 33.75 + 67.5 * sr; }
+// The cluster of act 4: the same 12 x 8 pattern, packed at a 33.75 px pitch.
+function clusterX(sc) { return gx(1) + 33.75 * (sc + 0.5); }
+function clusterY(sr, t) { return gy(1) + 33.75 * (sr + 0.5) + CELL * spring(t, hit(3, 3), LS); }
+
+// 16th-note hi-hat of act 3: on 16th number k, module column k mod 12 pulses.
+function pulse3(sc, t) {
+  let e = 0;
+  for (let k = sc; k < 16; k += 12) {
+    const tau = t - (A[2] + k * BEAT / 4);
+    const v = tau < 0 ? smooth((tau + 0.05) / 0.05) : Math.exp(-tau / 0.08);
+    e = Math.max(e, v);
+  }
+  return e;
+}
+const MERGE = A[4];                  // the many become one at the start of act 5
+function moduleState(m, t) {
+  const p = MODS[m];
+  const c = copyState(p.parent, t);
+  // act 3, beat 1: fly from the parent copy to the slot, shrink 101 -> 51
+  const kB = spring(t, A[2], LK);
+  let x = lerp(c.x, slotX(p.sc), kB), y = lerp(c.y, slotY(p.sr), kB);
+  let size = lerp(c.size, 51, kB);
+  size += (39 - 51) * spring(t, hit(2, 2), LS);        // act 3, beat 3: one size step down
+  if (t > A[2] - 0.1 && t < A[3]) size += 10 * pulse3(p.sc, t);  // the 16th pulses (+10 px keeps the gaps open)
+  // act 4, beat 1: the many gather into a tight cluster
+  const kC = spring(t, A[3], 0.45);
+  x = lerp(x, clusterX(p.sc), kC); y = lerp(y, clusterY(p.sr, t), kC);
+  size = lerp(size, 27, kC);
+  // act 5, beat 1: the gaps close (27 -> 33.75), the cluster becomes one block
+  size = lerp(size, 33.75, smooth((t - (MERGE - 0.4)) / 0.4));
+  return { x, y, size };
+}
+
+/* ---- Act 5: the morph, one block -> one circle ---------------------- */
+// A rounded rectangle whose corners grow until it is a perfect circle.
+// The radius never exceeds half the shorter side, so every in-between
+// shape is one clean convex outline.
+const MORPH_END = hit(4, 2);
+function morphShape(t) {
+  const m = smooth((t - MERGE) / (MORPH_END - MERGE));
+  const x = gx(1), w = 405;
+  const y = gy(2) - CELL * m, h = 270 + CELL * m;
+  return { x, y, w, h, r: 202.5 * m };
+}
+
+/* ---- The words ------------------------------------------------------ */
+// Each word: where it lands, when it lands, when it leaves, its colour.
+// It slides up into place (less than one cell) while fading in.
+let WORDS = [], LOCK = [];
+function layoutWords() {
+  measureCache.clear();
+  const defs = [
+    ['w_unus', 'UNUS', gx(0), 810, BLACK, hit(0, 1), A[3]],
+    ['w_pro', 'PRO', gx(0), 945, BLACK, hit(1, 1), A[3]],
+    ['w_omnibus', 'OMNIBUS,', gx(0), 1080, BLACK, hit(1, 2), A[3]],
+    ['w_omnes', 'OMNES', gx(2), 810, WHITE, hit(3, 1), A[5]],
+    ['w_pro2', 'PRO', gx(2), 945, WHITE, hit(4, 1), A[5]],
+    ['w_uno', 'UNO', gx(2), 1080, RED, hit(4, 2), A[5]],
+  ];
+  WORDS = defs.map(([id, str, x, base, col, land, until]) => {
+    const size = fitSize(str, 'bold', LIVE.x1 - x, 136, col === RED ? 84 : 52);
+    const m = measure(str, size, 'bold');
+    // slide distance: up to one cell, but keep the box above the hi-hat marks
+    const slide = Math.max(0, Math.min(CELL, 1180 - (base + m.desc)));
+    return { id, str, x, base, col, land, until, size, slide };
+  });
+
+  // Act 6 lockup: the whole sentence, broken into lines at word boundaries.
+  const sentence = ['UNUS', 'PRO', 'OMNIBUS,', 'OMNES', 'PRO', 'UNO'];
+  const reds = [true, false, false, false, false, true];
+  let size = 136, lines;
+  for (const s of [136, 84]) {
+    size = s; lines = [[]];
+    const space = measure(' ', s, 'bold').w;
+    let lineW = 0;
+    sentence.forEach((wd, i) => {
+      const w = measure(wd, s, 'bold').w;
+      const need = lineW === 0 ? w : lineW + space + w;
+      if (lineW > 0 && need * 1.05 > LIVE.x1 - LIVE.x0) { lines.push([]); lineW = w; }
+      else lineW = need;
+      lines[lines.length - 1].push(i);
+    });
+    if (lines.length <= 4) break;
+  }
+  LOCK = [];
+  const space = measure(' ', size, 'bold').w;
+  lines.forEach((ln, li) => {
+    let x = gx(0);
+    for (const i of ln) {
+      LOCK.push({ id: 'l_' + i, str: sentence[i], x, base: 540 + CELL * li, size,
+                  col: reds[i] ? RED : BLACK });
+      x += measure(sentence[i], size, 'bold').w + space;
+    }
+  });
+}
+function drawWords(t) {
+  for (const w of WORDS) {
+    const start = w.land - LW;
+    if (t < start || t >= w.until) continue;
+    const k = spring(t, w.land, LW, ZW);
+    ALPHA = smooth((t - start) / (LW * 0.8));
+    text(w.id, w.str, w.x, w.base + w.slide * (1 - k), w.size, 'bold', w.col);
+  }
+  ALPHA = 1;
+}
+
+/* ---------------------------------------------------------------------
+   STAGE 3: the hi-hat marks
+   Each act writes its own hi-hat pattern as a row of small 17 px ticks
+   along the bottom edge of the live area, at the position in the bar
+   where each hit falls. A tick grows in on its hit; at the end of the
+   act the row shrinks away.
+   --------------------------------------------------------------------- */
+const sixteenths = Array.from({ length: 16 }, (_, i) => i / 4);
+const HATS = [
+  [0.5, 1, 1.5, 2, 2.5, 3, 3.5],                    // act 1: straight 8ths (t = 0 stays white)
+  [0, 0.75, 1.5, 2.25, 3, 3.75],                    // act 2: syncopated, every 3rd 16th
+  sixteenths,                                       // act 3: straight 16ths
+  Array.from({ length: 12 }, (_, i) => i / 3),      // act 4: 8th-note triplets
+  [0.25, 0.75, 1.25, 1.75, 2.25, 2.75, 3.25, 3.75], // act 5: off-beat 16ths (syncopation)
+  [0.5, 1.5, 2.5],                                  // act 6: off-beat 8ths
+];
+function drawHats(t, act) {
+  const col = act === 3 || act === 4 ? WHITE : BLACK;
+  const end = A[act] + BAR;
+  const fadeOut = 1 - smooth((t - (end - 0.25)) / 0.2);
+  HATS[act].forEach((pos, i) => {
+    const s = 17 * spring(t, A[act] + pos * BEAT, 0.08) * fadeOut;
+    if (s > 0.2) rect('h' + act + '_' + i, LIVE.x0 + pos * 202.5, LIVE.y1 - s, 17, s, col);
+  });
+}
+
+/* ---------------------------------------------------------------------
+   The whole picture at time t. Draws (or, if dry, only records) it and
+   returns the list of what was drawn.
+   --------------------------------------------------------------------- */
+function scene(t, dry) {
+  t = ((t % LOOP) + LOOP) % LOOP;
+  const act = Math.min(5, Math.floor(t / BAR + 1e-9));
+  LIST = []; DRY = !!dry; ALPHA = 1;
+
+  // Background: white, or the black field of acts 4 and 5 (hard cut at t = 8).
+  field('bg', WHITE);
+  if (t >= CUTS[0] && t < CUTS[1]) field('black', BLACK);
+
+  if (t < CUTS[1]) {
+    // --- the thin rule of acts 1-3 (black) ---
+    if (t >= hit(0, 2) - LR && t < CUTS[0]) {
+      let x1 = gx(0) + 810 * spring(t, hit(0, 2), LR);          // act 1, beat 3: it grows
+      x1 -= 405 * spring(t, hit(2, 1), LS + 0.05);               // act 3, beat 2: it shrinks
+      x1 += 405 * spring(t, hit(2, 3), LS + 0.05);               // act 3, beat 4: it grows back
+      rule('rule1', gx(0), x1, gy(4), BLACK);
+    }
+    // --- the white rule of acts 4-5 ---
+    if (t >= hit(3, 2) - LR) {
+      const x0 = gx(0) + CELL * spring(t, hit(4, 3), LS);       // act 5, beat 4: it shrinks
+      const x1 = gx(0) + 810 * spring(t, hit(3, 2), LR) - 270 * spring(t, hit(4, 3), LS);
+      rule('rule2', x0, x1, gy(4), WHITE);
+    }
+    // --- act 1: the one red square ---
+    if (t < SPLIT) {
+      const s = sState(t);
+      rect('S', s.x - s.size / 2, s.y - s.size / 2, s.size, s.size, RED);
+    }
+    // --- acts 2-4: copies and modules (black/white first, red on top) ---
+    if (t >= SPLIT && t < MERGE) {
+      const showAll = t >= A[2] - LK;   // black modules are born at act 3
+      const after = t >= CUTS[0];
+      for (const pass of [false, true]) {
+        for (let m = 0; m < MODS.length; m++) {
+          const p = MODS[m];
+          if (p.red !== pass || (!p.red && !showAll)) continue;
+          const s = moduleState(m, t);
+          rect('m' + m, s.x - s.size / 2, s.y - s.size / 2, s.size, s.size,
+               p.red ? RED : after ? WHITE : BLACK);
+        }
+      }
+    }
+    // --- act 5: one block that morphs into one circle ---
+    if (t >= MERGE) {
+      const g = morphShape(t);
+      roundRect('one', g.x, g.y, g.w, g.h, g.r, RED);
+    }
+    drawWords(t);
+    drawHats(t, act);
+  } else {
+    // --- act 6: the lockup, white, hard cut on beat 1 ---
+    ALPHA = 1 - smooth((t - (hit(5, 3) - 0.3)) / 0.3);         // clears to white on beat 4
+    const rx1 = gx(0) + 810 * spring(t, hit(5, 1), LR);         // beat 2: a rule grows
+    rule('rule3', gx(0), rx1, gy(2), BLACK);
+    const cx = gx(5) - CELL * spring(t, hit(5, 2), LS);         // beat 3: the circle steps left
+    circle('one6', cx, gy(1), CELL, RED);
+    for (const w of LOCK) text(w.id, w.str, w.x, w.base, w.size, 'bold', w.col);
+    text('caption', '90 BPM — 4/4 — 16 S', gx(0), 1080, 52, 'normal', BLACK);
+    drawHats(t, act);
+    ALPHA = 1;
+  }
+  return LIST;
+}
+
+/* ---------------------------------------------------------------------
+   Screen: fit 1080 x 1350 into the window, pixel density capped at 2.
+   --------------------------------------------------------------------- */
+let scale = 1;
+function resize() {
+  const fit = Math.min(window.innerWidth / W, window.innerHeight / H);
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  canvas.style.width = Math.round(W * fit) + 'px';
+  canvas.style.height = Math.round(H * fit) + 'px';
+  canvas.width = Math.round(W * fit * dpr);
+  canvas.height = Math.round(H * fit * dpr);
+  scale = canvas.width / W;
+}
+
+/* Debug views: D shows bar.beat, F shows every recorded box. */
+let showD = false, showF = false;
+const dbg = document.getElementById('dbg');
+function drawCheckView(t, list) {
+  const probs = checkFrame(list, t);
+  const prevList = scene(t - 1 / 60, true);   // previous frame, for the jump rule
+  probs.push(...checkJumps(prevList, list, t - 1 / 60, t));
+  const onBeat = Math.abs(t / BEAT - Math.round(t / BEAT)) < 1e-6;
+  if (onBeat) probs.push(...checkBalance(list, t));
+  LIST = list;
+  const badIds = new Set();
+  probs.forEach(p => p.id.split('/').forEach(id => badIds.add(id)));
+  ctx.globalAlpha = 1; ctx.lineWidth = 2;
+  for (const e of list) {
+    if (e.kind === 'field') continue;
+    ctx.strokeStyle = badIds.has(e.id) || badIds.has('*') ? '#ff0000' : '#00c000';
+    ctx.strokeRect(e.x, e.y, e.w, e.h);
+  }
+  return probs;
+}
+
+/* Draw the frame at time t on the real canvas. */
+let tNow = 0;
+function render(t) {
+  ctx.setTransform(scale, 0, 0, scale, 0, 0);
+  const list = scene(t, false);
+  let probs = [];
+  if (showF) probs = drawCheckView(((t % LOOP) + LOOP) % LOOP, list);
+  if (showD) {
+    const tt = ((t % LOOP) + LOOP) % LOOP;
+    const b = Math.floor(tt / BEAT + 1e-9);
+    dbg.textContent = 'bar.beat ' + (Math.floor(b / 4) + 1) + '.' + (b % 4 + 1) +
+      '   t=' + tt.toFixed(2) + (showF ? '   problems: ' + probs.length : '');
+  }
+}
+
+/* ---------------------------------------------------------------------
+   Playback. t = elapsed seconds mod 16, from requestAnimationFrame.
+   --------------------------------------------------------------------- */
+let playing = true, startMs = performance.now();
+window.seek = function (t) {
+  tNow = ((t % LOOP) + LOOP) % LOOP;
+  startMs = performance.now() - tNow * 1000;
+  audioCursor = null;
+  render(tNow);
+  return LIST;
+};
+window.setPlaying = function (p) {
+  playing = p;
+  if (p) startMs = performance.now() - tNow * 1000;
+  audioCursor = null;
+};
+function loop(now) {
+  if (playing) tNow = ((now - startMs) / 1000) % LOOP;
+  render(tNow);
+  scheduleAudio(tNow);
+  requestAnimationFrame(loop);
+}
+// Time how long one frame takes to draw (whole loop, every 1/60 s).
+// This is a test tool, run while paused: reading back one pixel forces the
+// browser to really finish painting each frame, so the timing is honest.
+// (Playback itself never reads pixels.)
+window.timeDraw = function () {
+  let sum = 0, worst = 0;
+  setPlaying(false);
+  for (let k = 0; k < 960; k++) {
+    const t0 = performance.now();
+    render(k / 60);
+    ctx.getImageData(0, 0, 1, 1);
+    const dt = performance.now() - t0;
+    sum += dt; worst = Math.max(worst, dt);
+  }
+  render(tNow);
+  return { avg: sum / 960, worst };
+};
+
+/* ---------------------------------------------------------------------
+   STAGE 3b: the drum metronome (key M). Web Audio, in sync with t.
+   kick on beat 1, softer kick on beat 3 (every act uses one),
+   snare on 2 and 4, closed hi-hat on the current act's pattern.
+   --------------------------------------------------------------------- */
+const EVENTS = [];
+for (let a = 0; a < 6; a++) {
+  EVENTS.push({ t: hit(a, 0), type: 'kick' }, { t: hit(a, 2), type: 'kick2' },
+              { t: hit(a, 1), type: 'snare' }, { t: hit(a, 3), type: 'snare' });
+  HATS[a].forEach(p => EVENTS.push({ t: A[a] + p * BEAT, type: 'hat' }));
+}
+let ac = null, metro = false, audioCursor = null, noiseBuf = null;
+function makeNoise() {
+  // A seeded random generator, so the noise is the same every time.
+  let s = 12345;
+  const rnd = () => { s = (s * 1664525 + 1013904223) >>> 0; return s / 4294967296; };
+  const buf = ac.createBuffer(1, ac.sampleRate * 0.3, ac.sampleRate);
+  const d = buf.getChannelData(0);
+  for (let i = 0; i < d.length; i++) d[i] = rnd() * 2 - 1;
+  return buf;
+}
+function play(type, when) {
+  const g = ac.createGain(); g.connect(ac.destination);
+  if (type === 'kick' || type === 'kick2') {
+    const o = ac.createOscillator();
+    o.frequency.setValueAtTime(150, when);
+    o.frequency.exponentialRampToValueAtTime(45, when + 0.12);
+    g.gain.setValueAtTime(type === 'kick' ? 0.9 : 0.45, when);
+    g.gain.exponentialRampToValueAtTime(0.001, when + 0.3);
+    o.connect(g); o.start(when); o.stop(when + 0.32);
+  } else {
+    const n = ac.createBufferSource(); n.buffer = noiseBuf;
+    const f = ac.createBiquadFilter(); f.type = 'highpass';
+    f.frequency.value = type === 'snare' ? 1200 : 7000;
+    const len = type === 'snare' ? 0.16 : 0.04;
+    g.gain.setValueAtTime(type === 'snare' ? 0.5 : 0.18, when);
+    g.gain.exponentialRampToValueAtTime(0.001, when + len);
+    n.connect(f); f.connect(g); n.start(when); n.stop(when + len + 0.02);
+  }
+}
+function scheduleAudio(t) {
+  if (!metro || !ac || !playing) { audioCursor = null; return; }
+  if (audioCursor === null) audioCursor = t - 0.001;
+  if (audioCursor - t > LOOP / 2) audioCursor -= LOOP;      // the loop wrapped around
+  const to = t + 0.12;                                       // look 120 ms ahead
+  for (const e of EVENTS)
+    for (const off of [0, LOOP]) {
+      const et = e.t + off;
+      if (et > audioCursor && et <= to) play(e.type, ac.currentTime + Math.max(0, et - t));
+    }
+  audioCursor = to;
+}
+
+/* ---------------------------------------------------------------------
+   Keys: Space pause, arrows step a beat, D overlay, M metronome, F check.
+   --------------------------------------------------------------------- */
+window.addEventListener('keydown', e => {
+  if (e.code === 'Space') { e.preventDefault(); window.setPlaying(!playing); }
+  else if (e.code === 'ArrowRight' || e.code === 'ArrowLeft') {
+    e.preventDefault();
+    const b = Math.round(tNow / BEAT) + (e.code === 'ArrowRight' ? 1 : -1);
+    window.setPlaying(false);
+    window.seek(((b % 24) + 24) % 24 * BEAT);
+  }
+  else if (e.code === 'KeyD') { showD = !showD; dbg.style.display = showD ? 'block' : 'none'; }
+  else if (e.code === 'KeyF') { showF = !showF; }
+  else if (e.code === 'KeyM') {
+    metro = !metro;
+    if (metro && !ac) { ac = new (window.AudioContext || window.webkitAudioContext)(); noiseBuf = makeNoise(); }
+    if (ac && ac.state === 'suspended') ac.resume();
+    audioCursor = null;
+  }
+});
+window.addEventListener('resize', () => { resize(); render(tNow); });
+
+/* Draw every word once before playback starts, so the browser has the
+   letter shapes ready and the first real frame with text is not slow. */
+function warmUp() {
+  layoutWords();
+  ctx.setTransform(scale, 0, 0, scale, 0, 0);
+  for (const s of SIZES) for (const wt of ['bold', 'normal']) {
+    ctx.font = fontOf(s, wt);
+    for (const c of [BLACK, WHITE, RED]) { ctx.fillStyle = c; ctx.fillText(WORDS_OK.join(' '), 0, 300); }
+  }
+  render(tNow);
+}
+resize();
+warmUp();
+if (document.fonts && document.fonts.ready) document.fonts.ready.then(warmUp);
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
