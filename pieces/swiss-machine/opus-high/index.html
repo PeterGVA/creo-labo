@@ -1,0 +1,1419 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Swiss Machine</title>
+<style>
+  /* The page is black; the 1080x1350 poster sits centred on it. */
+  html, body { margin: 0; height: 100%; background: #000000; overflow: hidden; }
+  canvas { position: absolute; display: block; }
+  #ui { pointer-events: none; }
+</style>
+</head>
+<body>
+<canvas id="view"></canvas>
+<canvas id="ui"></canvas>
+<script>
+"use strict";
+/* =====================================================================
+   SWISS MACHINE
+   A 16-second poster loop at 90 BPM. Everything you see is drawn by the
+   code below: the typeface, the layouts, the critic that checks them,
+   and the print finish. No fonts, images or libraries are loaded.
+
+   How to read this file (top to bottom):
+     1. Constants      - sizes, colours, timing
+     2. Motion helpers - easing curves and the spring used for landings
+     3. Random numbers - our own seeded generator (mulberry32)
+     4. The typeface   - letters built from strokes on a skeleton
+     5. The machine    - composes an edition from a seed
+     6. The critic     - checks an edition against the rules
+     7. Drawing        - the six acts, one per bar, on three layers
+     8. GPU finish     - WebGL2 shader: depth blur, line screen, grain,
+                         and the particle swarm
+     9. Main loop, keys and the window.seek / window.edition API
+   ===================================================================== */
+
+
+/* ---------------------------------------------------------------------
+   1. CONSTANTS
+   --------------------------------------------------------------------- */
+const W = 1080, H = 1350;          // poster size in "stage pixels"
+const M = 135;                     // margin = one grid cell
+const CELL = 135;                  // the grid: 6 columns x 8 rows of 135 px squares
+const SUB = CELL / 4;              // a quarter cell (33.75 px): the baseline grid for small type
+const LIVE = { x0: M, y0: M, x1: W - M, y1: H - M };   // the area inside the margins
+
+const WHITE = '#ffffff', BLACK = '#111111', RED = '#e30613';
+const PALETTE = [WHITE, BLACK, RED];
+
+const BEAT = 60 / 90;              // 90 beats per minute: one beat = 2/3 s
+const BAR = 4 * BEAT;              // 4/4 time: one bar = 8/3 s
+const LOOP = 16;                   // 6 bars = 24 beats = 16 s
+
+const LADDER = [17, 34, 68, 135, 270, 540, 1080];   // the only allowed cap heights
+const RULE_THICK = [2, 4, 8, 17, 34];                // the only allowed rule thicknesses
+const NARROW = 0.45, WIDE = 1.45;                    // the width dial's two ends
+
+// Grid helpers: x of column line c (0..6), y of row line r (0..8).
+const colX = c => M + c * CELL;
+const rowY = r => M + r * CELL;
+
+// The word sets. Each edition uses one German / French / Italian set.
+const SETS = [
+  ['PROGRAMM', 'PROGRAMME', 'PROGRAMMA'],
+  ['RASTER', 'TRAME', 'GRIGLIA'],
+  ['FORM', 'FORME', 'FORMA'],
+  ['ZEIT', 'TEMPS', 'TEMPO'],
+  ['RHYTHMUS', 'RYTHME', 'RITMO'],
+  ['PUNKT', 'POINT', 'PUNTO'],
+];
+
+
+/* ---------------------------------------------------------------------
+   2. MOTION HELPERS
+   Everything moves as a pure function of time t. Nothing remembers the
+   previous frame, so any moment can be drawn on its own (seek works).
+   --------------------------------------------------------------------- */
+const clamp01 = x => (x < 0 ? 0 : x > 1 ? 1 : x);
+const lerp = (a, b, k) => a + (b - a) * k;
+const easeInCubic = x => x * x * x;
+const easeOutCubic = x => 1 - Math.pow(1 - x, 3);
+const easeInOut = x => (x < 0.5 ? 4 * x * x * x : 1 - Math.pow(-2 * x + 2, 3) / 2);
+
+/* land(t, tb, lead): progress of a move that lands exactly on the beat tb.
+   - Before tb - lead: 0 (not started).
+   - From tb - lead to tb: speeds up (ease-in), reaching 1 exactly at tb.
+   - After tb: a damped spring wobbles around 1 and settles.
+   The spring is a formula of the time since landing, so it needs no memory. */
+function land(t, tb, lead, amp = 0.09, freq = 22, damp = 8) {
+  if (t < tb - lead) return 0;
+  if (t < tb) { const u = (t - tb + lead) / lead; return u * u * u; }
+  const s = t - tb;
+  return 1 + amp * Math.exp(-damp * s) * Math.sin(freq * s);
+}
+// Is a move that lands on tb happening right now? (Used to switch motion blur on.)
+const inMove = (t, tb, lead) => t > tb - lead && t < tb + 0.1;
+
+/* Motion blur: draw a moving element at several moments between t - 1/60 and t.
+   The earliest copy is faint, the latest is solid, so the element leaves a
+   short trail behind it. fn(time) draws the element as it was at that time. */
+function blurDraw(ctx, t, moving, fn) {
+  const n = moving ? 4 : 1;
+  for (let i = 0; i < n; i++) {
+    ctx.globalAlpha = (i + 1) / n;
+    fn(n === 1 ? t : t - (1 / 60) * (n - 1 - i) / (n - 1));
+  }
+  ctx.globalAlpha = 1;
+}
+
+
+/* ---------------------------------------------------------------------
+   3. RANDOM NUMBERS
+   mulberry32: a tiny generator. The same seed always gives the same
+   sequence, so edition N always looks the same. Math.random is never used.
+   --------------------------------------------------------------------- */
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+// The sub-seed for attempt number `attempt` of edition n.
+function subSeed(n, attempt) {
+  return (Math.imul(n, 2654435761) ^ Math.imul(attempt + 1, 40503) ^ 0x5eed) >>> 0;
+}
+
+
+/* ---------------------------------------------------------------------
+   4. THE TYPEFACE
+   Every letter is a set of strokes (lines and arcs) drawn along a
+   "skeleton". The skeleton lives in a box W wide and H tall, measured
+   from the centre of the strokes. Two dials change every letter:
+     weight: 0 = hairline, 1 = ultra heavy (the stroke thickness)
+     width:  0.45 = condensed ... 1.45 = extended (the box width)
+   Because every letter is just a list of strokes, any letter can be
+   turned into any other by sliding the stroke points (see drawMorph).
+   --------------------------------------------------------------------- */
+
+// Stroke thickness for a cap height and weight dial.
+function strokeW(cap, wd) {
+  const hair = Math.max(2, cap * 0.012), heavy = cap * 0.22;
+  return hair + (heavy - hair) * wd;
+}
+const gapW = (cap, wid) => cap * (0.06 + 0.07 * wid);   // space between letters
+const spaceW = (cap, wid) => cap * 0.3 * wid;            // a word space
+
+// How wide each letter's skeleton is, relative to the cap height.
+const BASE = {
+  A: .86, B: .72, C: .82, D: .82, E: .66, F: .64, G: .86, H: .78, I: 0, J: .62,
+  K: .74, L: .62, M: 1.0, N: .78, O: .92, P: .72, Q: .92, R: .74, S: .70, T: .74,
+  U: .76, V: .84, W: 1.18, X: .80, Y: .80, Z: .72,
+  '0': .66, '1': .40, '2': .66, '3': .66, '4': .70, '5': .66, '6': .66, '7': .64,
+  '8': .66, '9': .66, '-': .42, '/': .50, '.': 0, ':': 0,
+};
+const outerW = (ch, cap, wd, wid) => (BASE[ch] ?? 0.78) * cap * wid + strokeW(cap, wd);
+
+// --- small builders for skeleton strokes (coordinates: x right, y UP) ---
+// P(...) joins points and point-lists into one open stroke.
+function P(...parts) {
+  const pts = [];
+  const add = q => {
+    const l = pts[pts.length - 1];
+    if (!l || Math.abs(l[0] - q[0]) + Math.abs(l[1] - q[1]) > 1e-6) pts.push([q[0], q[1]]);
+  };
+  for (const p of parts) { if (typeof p[0] === 'number') add(p); else p.forEach(add); }
+  return { pts, closed: false };
+}
+// Points along a circle arc (angles in degrees, counter-clockwise).
+function arc(cx, cy, r, a0, a1) {
+  const n = Math.max(1, Math.ceil(Math.abs(a1 - a0) / 6)), out = [];
+  for (let i = 0; i <= n; i++) {
+    const a = (a0 + (a1 - a0) * i / n) * Math.PI / 180;
+    out.push([cx + r * Math.cos(a), cy + r * Math.sin(a)]);
+  }
+  return out;
+}
+// A closed rounded rectangle (O, 0, 8 and the bowls of 6 and 9).
+function ring(x0, y0, x1, y1, r) {
+  r = Math.max(0, Math.min(r, (x1 - x0) / 2, (y1 - y0) / 2));
+  const ym = (y0 + y1) / 2;
+  const s = P([x0, ym], [x0, y0 + r], arc(x0 + r, y0 + r, r, 180, 270), [x1 - r, y0],
+    arc(x1 - r, y0 + r, r, 270, 360), [x1, y1 - r], arc(x1 - r, y1 - r, r, 0, 90),
+    [x0 + r, y1], arc(x0 + r, y1 - r, r, 90, 180));
+  const a = s.pts[0], b = s.pts[s.pts.length - 1];
+  if (Math.abs(a[0] - b[0]) + Math.abs(a[1] - b[1]) < 1e-6) s.pts.pop();
+  s.closed = true;
+  return s;
+}
+// Part of the rounded-rectangle outline, by "corner angle" a0..a1 (C and G).
+function ringArc(Wd, Ht, a0, a1) {
+  const r = Math.min(Wd, Ht) / 2;
+  const cs = [[Wd - r, Ht - r], [r, Ht - r], [r, r], [Wd - r, r]];
+  const pts = [];
+  for (let q = 0; q < 4; q++) {
+    const lo = Math.max(a0, q * 90), hi = Math.min(a1, q * 90 + 90);
+    if (hi >= lo) pts.push(...arc(cs[q][0], cs[q][1], r, lo, hi));
+  }
+  return pts;
+}
+// A "D-shaped" bowl from (xl,yt) right, round, and back to (xl,yb). Used by B D P R.
+function bowl(xl, yb, xr, yt, r) {
+  r = Math.max(0, Math.min(r, (yt - yb) / 2, xr - xl));
+  return P([xl, yt], [xr - r, yt], arc(xr - r, yt - r, r, 90, 0), [xr, yb + r],
+    arc(xr - r, yb + r, r, 0, -90), [xl, yb]);
+}
+
+// A diagonal leg that starts inside another stroke: its square end is pulled in
+// by half a stroke so it never pokes out into the counter.
+function leg(sx, sy, ex, ey, w) {
+  const l = Math.hypot(ex - sx, ey - sy) || 1;
+  return P([sx + (ex - sx) / l * w / 2, sy + (ey - sy) / l * w / 2], [ex, ey]);
+}
+
+/* The alphabet. Each entry gets (W, H, w, cap): skeleton width, skeleton height,
+   stroke thickness and cap height, and returns its list of strokes.
+   Shared parts: stems, bars, bowls, rings and diagonals are reused everywhere. */
+const GLYPHS = {
+  A: (W, H) => [P([0, 0], [W / 2, H], [W, 0]), P([.15 * W, .3 * H], [.85 * W, .3 * H])],
+  B: (W, H) => { const r = Math.min(W * .5, H / 4); return [P([0, 0], [0, H]), bowl(0, H / 2, W * .9, H, r), bowl(0, 0, W, H / 2, r)]; },
+  C: (W, H) => [P(ringArc(W, H, 45, 315))],
+  D: (W, H) => [P([0, 0], [0, H]), bowl(0, 0, W, H, Math.min(W, H / 2))],
+  E: (W, H) => [P([W, H], [0, H], [0, 0], [W, 0]), P([0, H / 2], [W * .82, H / 2])],
+  F: (W, H) => [P([W, H], [0, H], [0, 0]), P([0, H / 2], [W * .82, H / 2])],
+  G: (W, H) => { const r = Math.min(W, H) / 2, yb = Math.max(r, .45 * H); return [P(ringArc(W, H, 45, 360), [W, yb], [W * .5, yb])]; },
+  H: (W, H) => [P([0, 0], [0, H]), P([W, 0], [W, H]), P([0, H / 2], [W, H / 2])],
+  I: (W, H) => [P([0, 0], [0, H])],
+  J: (W, H) => { const r = Math.min(W / 2, H / 2); return [P([W, H], [W, r], arc(W - r, r, r, 360, 270), [r, 0], arc(r, r, r, 270, 180), [0, Math.max(r, .3 * H)])]; },
+  K: (W, H, w) => [P([0, 0], [0, H]), P([W, H], [0, .35 * H]), leg(.42 * W, .35 * H + .42 * .65 * H, W, 0, w)],
+  L: (W, H) => [P([0, H], [0, 0], [W, 0])],
+  M: (W, H) => [P([0, 0], [0, H], [W / 2, .25 * H], [W, H], [W, 0])],
+  N: (W, H) => [P([0, 0], [0, H], [W, 0], [W, H])],
+  O: (W, H) => [ring(0, 0, W, H, Math.min(W, H) / 2)],
+  P: (W, H) => [P([0, 0], [0, H]), bowl(0, .42 * H, W, H, Math.min(W, .29 * H))],
+  Q: (W, H) => [ring(0, 0, W, H, Math.min(W, H) / 2), P([.58 * W, .28 * H], [W, 0])],
+  R: (W, H, w) => [P([0, 0], [0, H]), bowl(0, .44 * H, W, H, Math.min(W, .28 * H)), leg(.5 * W, .44 * H, W, 0, w)],
+  S: (W, H) => { const r = Math.min(W / 2, H / 4); return [P([W, H], [r, H], arc(r, H - r, r, 90, 180), [0, H / 2 + r], arc(r, H / 2 + r, r, 180, 270), [W - r, H / 2], arc(W - r, H / 2 - r, r, 90, 0), [W, r], arc(W - r, r, r, 0, -90), [0, 0])]; },
+  T: (W, H) => [P([0, H], [W, H]), P([W / 2, H], [W / 2, 0])],
+  U: (W, H) => { const r = Math.min(W / 2, H / 2); return [P([0, H], [0, r], arc(r, r, r, 180, 270), [W - r, 0], arc(W - r, r, r, 270, 360), [W, H])]; },
+  V: (W, H) => [P([0, H], [W / 2, 0], [W, H])],
+  W: (W, H) => [P([0, H], [.25 * W, 0], [.5 * W, .7 * H], [.75 * W, 0], [W, H])],
+  X: (W, H) => [P([0, 0], [W, H]), P([0, H], [W, 0])],
+  Y: (W, H) => [P([0, H], [W / 2, .45 * H], [W, H]), P([W / 2, .45 * H], [W / 2, 0])],
+  Z: (W, H) => [P([0, H], [W, H], [0, 0], [W, 0])],
+  '0': (W, H) => [ring(0, 0, W, H, Math.min(W, H) / 2)],
+  '1': (W, H) => [P([0, .72 * H], [W, H], [W, 0])],
+  '2': (W, H) => { const r = Math.min(W / 2, H / 4); return [P([0, H - r], arc(r, H - r, r, 180, 90), [W - r, H], arc(W - r, H - r, r, 90, 0), [W, H - r], [0, 0], [W, 0])]; },
+  '3': (W, H) => { const r = Math.min(W / 2, .28 * H), y = .58 * H; return [P([0, H], [W, H], [.3 * W, y], [W - r, y], arc(W - r, y - r, r, 90, 0), [W, r], arc(W - r, r, r, 0, -90), [0, 0])]; },
+  '4': (W, H) => [P([.72 * W, 0], [.72 * W, H], [0, .32 * H], [W, .32 * H])],
+  '5': (W, H) => { const r = Math.min(W / 2, .28 * H), y = .56 * H; return [P([W, H], [0, H], [0, y], [W - r, y], arc(W - r, y - r, r, 90, 0), [W, r], arc(W - r, r, r, 0, -90), [0, 0])]; },
+  '6': (W, H) => { const r = Math.min(W / 2, .28 * H), q = Math.min(W / 2, H / 4); return [ring(0, 0, W, .56 * H, r), P([W, H], [q, H], arc(q, H - q, q, 90, 180), [0, H - q], [0, .28 * H])]; },
+  '7': (W, H) => [P([0, H], [W, H], [.22 * W, 0])],
+  '8': (W, H) => { const r = Math.min(W / 2, H / 4); return [ring(.06 * W, .5 * H, .94 * W, H, Math.min(.44 * W, H / 4)), ring(0, 0, W, .5 * H, r)]; },
+  '9': (W, H) => { const r = Math.min(W / 2, .28 * H), q = Math.min(W / 2, H / 4); return [ring(0, .44 * H, W, H, r), P([0, 0], [W - q, 0], arc(W - q, q, q, 270, 360), [W, q], [W, .72 * H])]; },
+  '-': (W, H) => [P([0, .45 * H], [W, .45 * H])],
+  '/': (W, H) => [P([0, 0], [W, H])],
+  '.': (W, H, w, cap) => [P([0, 0], [0, Math.max(0.01, .12 * cap - w)])],
+  ':': (W, H, w, cap) => { const d = Math.max(0.01, .12 * cap - w); return [P([0, 0], [0, d]), P([0, .55 * H], [0, .55 * H + d])]; },
+};
+
+// Build one letter's strokes for a size and dial setting.
+function glyphGeom(ch, cap, wd, wid) {
+  const w = strokeW(cap, wd);
+  const Wc = (BASE[ch] ?? 0.78) * cap * wid;  // skeleton width
+  const Hc = cap - w;                         // skeleton height (so the outside edge = cap height)
+  const f = GLYPHS[ch];
+  return { w, Wc, outer: Wc + w, strokes: f ? f(Wc, Hc, w, cap) : [] };
+}
+
+/* A letter becomes a Path2D (a reusable canvas path). We keep finished paths
+   in a cache, so static text costs almost nothing to redraw each frame.
+   Coordinates: origin at the left of the baseline, y down (canvas style). */
+const pathCache = new Map();
+function glyphPath(ch, cap, wd, wid, useCache = true) {
+  const key = ch + '|' + cap + '|' + wd + '|' + wid;
+  if (useCache) { const hit = pathCache.get(key); if (hit) return hit; }
+  const g = glyphGeom(ch, cap, wd, wid), p = new Path2D(), h = g.w / 2;
+  for (const s of g.strokes) {
+    p.moveTo(h + s.pts[0][0], -(h + s.pts[0][1]));
+    for (let i = 1; i < s.pts.length; i++) p.lineTo(h + s.pts[i][0], -(h + s.pts[i][1]));
+    if (s.closed) p.closePath();
+  }
+  const e = { path: p, outer: g.outer };
+  if (useCache) { if (pathCache.size > 1500) pathCache.clear(); pathCache.set(key, e); }
+  return e;
+}
+
+// Width of a line of text (used by the layout machine and the critic).
+function measure(str, cap, wd, wid) {
+  let x = 0;
+  for (let i = 0; i < str.length; i++) {
+    const ch = str[i];
+    if (ch === ' ') x += spaceW(cap, wid);
+    else { x += outerW(ch, cap, wd, wid); if (i < str.length - 1) x += gapW(cap, wid); }
+  }
+  return x;
+}
+
+// Common stroke settings: square ends and sharp corners (no round "pill" ends).
+function inkPen(ctx, color, w) {
+  ctx.strokeStyle = color; ctx.lineWidth = w;
+  ctx.lineCap = 'square'; ctx.lineJoin = 'miter'; ctx.miterLimit = 2;
+}
+
+/* Draw a line of text with its left edge at x and its baseline at `base`.
+   Letters that fall outside [-60, limit] are skipped (cropped by the frame). */
+function drawText(ctx, str, x, base, cap, wd, wid, color, useCache = true, limit = W + 60) {
+  inkPen(ctx, color, strokeW(cap, wd));
+  let cx = x;
+  const gp = gapW(cap, wid);
+  for (let i = 0; i < str.length; i++) {
+    const ch = str[i];
+    if (ch === ' ') { cx += spaceW(cap, wid); continue; }
+    const g = glyphPath(ch, cap, wd, wid, useCache);
+    if (cx < limit && cx + g.outer > -60) {
+      ctx.translate(cx, base); ctx.stroke(g.path); ctx.translate(-cx, -base);
+    }
+    cx += g.outer + gp;
+  }
+  return cx - x;
+}
+
+/* MORPH: turn letter a into letter b (k = 0..1).
+   Each stroke is resampled to the same number of points, strokes are
+   paired longest-with-longest, and missing strokes grow out of a point
+   with zero thickness. Then every point simply slides from a to b. */
+const NP = 48;
+function resample(s, n) {
+  const src = s.pts.slice();
+  if (s.closed) src.push(src[0]);
+  const acc = [0];
+  for (let i = 1; i < src.length; i++) acc.push(acc[i - 1] + Math.hypot(src[i][0] - src[i - 1][0], src[i][1] - src[i - 1][1]));
+  const tot = acc[acc.length - 1], out = [];
+  for (let i = 0; i < n; i++) {
+    const d = tot * i / (s.closed ? n : n - 1);
+    let j = 1;
+    while (j < acc.length - 1 && acc[j] < d) j++;
+    const seg = acc[j] - acc[j - 1] || 1, u = Math.min(1, Math.max(0, (d - acc[j - 1]) / seg));
+    out.push([lerp(src[j - 1][0], src[j][0], u), lerp(src[j - 1][1], src[j][1], u)]);
+  }
+  return { pts: out, closed: s.closed, len: tot };
+}
+function prepMorph(ch, cap, wd, wid) {
+  const g = glyphGeom(ch, cap, wd, wid);
+  const ss = g.strokes.map(s => resample(s, NP)).sort((a, b) => b.len - a.len);
+  return { g, ss };
+}
+function drawMorph(ctx, a, b, k, x, base, cap, wd, wid, color) {
+  // At rest, draw the real letter: resampling would round off its sharp corners.
+  if (k <= 0.001 || a === b) { drawText(ctx, a, x, base, cap, wd, wid, color); return; }
+  if (Math.abs(k - 1) < 0.02) { drawText(ctx, b, x, base, cap, wd, wid, color); return; }
+  const A = prepMorph(a, cap, wd, wid), B = prepMorph(b, cap, wd, wid);
+  const n = Math.max(A.ss.length, B.ss.length), w = strokeW(cap, wd), h = w / 2;
+  const pad = (S, i) => {
+    if (i < S.ss.length) return [S.ss[i], 1];
+    const mid = S.ss[0].pts[NP >> 1];            // a hidden stroke sits at the middle of the longest one
+    return [{ pts: new Array(NP).fill(mid), closed: false }, 0];
+  };
+  inkPen(ctx, color, w);
+  const solid = new Path2D();
+  for (let i = 0; i < n; i++) {
+    const [sa, fa] = pad(A, i), [sb, fb] = pad(B, i);
+    const f = lerp(fa, fb, clamp01(k));
+    if (f < 0.01) continue;
+    const closed = (k < 0.5 ? sa.closed : sb.closed);
+    const p = f > 0.999 ? solid : new Path2D();
+    for (let j = 0; j < NP; j++) {
+      const px = x + h + lerp(sa.pts[j][0], sb.pts[j][0], k);
+      const py = base - (h + lerp(sa.pts[j][1], sb.pts[j][1], k));
+      if (j === 0) p.moveTo(px, py); else p.lineTo(px, py);
+    }
+    if (closed) p.closePath();
+    if (p !== solid) { ctx.lineWidth = w * f; ctx.stroke(p); ctx.lineWidth = w; }
+  }
+  ctx.stroke(solid);
+}
+
+
+/* ---------------------------------------------------------------------
+   5. THE MACHINE
+   generate(n, attempt) composes one edition from a sub-seed. It returns
+   plain data: words, the axis, sizes, positions, rules. The drawing code
+   only animates that data; the critic only checks it.
+   --------------------------------------------------------------------- */
+const pad4 = n => String(n).padStart(4, '0');
+const uniqueLetters = s => [...new Set(s.replace(/[^A-Z]/g, '').split(''))];
+
+// Element makers. A text element hangs from (x, base); a rule is a filled bar.
+const T = (str, x, base, cap, wd, wid, color = BLACK) => ({ kind: 'text', str, x, base, cap, wd, wid, color });
+const Rl = (x, y, len, thick, color) => ({ kind: 'rule', x, y, len, thick, color });
+
+function generate(n, attempt) {
+  const seed = subSeed(n, attempt), R = mulberry32(seed);
+  const pick = a => a[Math.floor(R() * a.length)];
+  const int = m => Math.floor(R() * m);
+  const chance = p => R() < p;
+  // Designer's instinct: usually pick an option that already looks right,
+  // but one time in ten pick blindly. The critic catches the bad ones.
+  const prefer = (options, ok) => {
+    const good = options.filter(ok);
+    return good.length && R() < 0.9 ? pick(good) : pick(options);
+  };
+  const edgeOK = el => { const b = bbox(el); return insideLive(b) || cropFraction(b) >= 0.25; };
+  const apart = (a, b) => !overlaps(bbox(a), bbox(b));
+
+  const set = n === 1 ? 0 : int(SETS.length);            // edition 1 always uses the first set
+  const rot = n === 1 ? 0 : int(3);                       // which language leads
+  const words = [0, 1, 2].map(i => SETS[set][(i + rot) % 3]);
+  const w1 = words[0];
+  const axisCol = pick([0, 0, 1, 1, 2, 3]);
+  const ax = colX(axisCol);                               // THE axis: every text block hangs here
+  const ed = { n, attempt, seed, set, words, axisCol, ax };
+
+  // ACT 1: cells are filled when (a*col + b*row) mod m < k.
+  const cellsOf = f => {
+    const out = [];
+    for (let r = 0; r < 8; r++) for (let c = 0; c < 6; c++)
+      if ((f.a * c + f.b * r) % f.m < f.k) out.push({ c, r });
+    return out;
+  };
+  const fills = [0, 1, 2, 3].map(() => { const f = { a: 1 + int(5), b: 1 + int(5), m: 2 + int(6) }; f.k = 1 + int(f.m - 1); return f; });
+  ed.fill = prefer(fills, f => patternFaults(cellsOf(f)).length === 0);
+  ed.cells = cellsOf(ed.fill);
+  const a1End = axisCol + 1 + int(6 - axisCol);
+  ed.a1 = { rule: Rl(ax, rowY(1 + int(7)), colX(a1End) - ax, pick([17, 34]), RED) };
+
+  // A small block: word 1 at 34 px with a red rule, near the top or the bottom margin.
+  const smallBlock = (top) => {
+    const base = top ? M + SUB : H - M;
+    return { text: T(w1, ax, base, 34, 1, 1), ruleY: top ? base + SUB : base - 3 * SUB };
+  };
+
+  // ACT 2: one giant letter, cropped by the frame, cycling through the dial.
+  {
+    const letter = pick(uniqueLetters(w1));
+    const mW = Math.min(4, 6 - axisCol);
+    const states = [[0, NARROW, 1], [1, WIDE, mW], [0, WIDE, mW], [1, NARROW, 1]];
+    const letterAt = (base, st) => T(letter, ax, base, 1080, st[0], st[1]);
+    // 945 crops only 12.5%: the critic refuses it when it slips through
+    const base = prefer([1620, 1755, 810, 945], b => states.every(st => cropFraction(bbox(letterAt(b, st))) >= 0.25));
+    const top = prefer([true, false], t => states.every(st => apart(letterAt(base, st), smallBlock(t).text)));
+    const sb = smallBlock(top);
+    ed.a2 = { letter, base, small: sb, states };
+  }
+
+  // ACT 3: four letters of word 1 morph into each other.
+  {
+    const letters = uniqueLetters(w1);
+    const start = chance(0.5) ? 0 : int(letters.length);
+    const seq = [0, 1, 2, 3].map(i => letters[(start + i) % letters.length]);
+    const cap = pick([540, 540, 1080]);
+    const wd = pick([0, 1]);
+    const bases = cap === 540 ? [675, 810, 945, 1080, 1215] : [1215, 1620, 810];
+    const L = (b, wi) => seq.map(ch => T(ch, ax, b, cap, wd, wi));
+    const wid = prefer([0.45, 0.7, 1, 1.25], wi => bases.some(b => L(b, wi).every(edgeOK)));
+    const base = prefer(bases, b => L(b, wid).every(edgeOK));
+    const top = prefer([true, false], t => L(base, wid).every(el => apart(el, smallBlock(t).text)));
+    ed.a3 = { seq, cap, wd, wid, base, small: smallBlock(top) };
+  }
+
+  // ACT 4: three words on a hinged plane, then locked flat on the axis.
+  {
+    const wd1 = pick([0, 1]);
+    const B1 = prefer([675, 810, 945], b => b + 270 + 3 * SUB + SUB <= H - M), B2 = B1 + 270, B3 = B2 + 3 * SUB;
+    const wid1 = prefer([0.45, 0.7, 1], wi => edgeOK(T(words[0], ax, B1, 540, wd1, wi)));
+    const wid2 = prefer([0.7, 1, 1.3], wi => edgeOK(T(words[1], ax, B2, 135, 1 - wd1, wi)));
+    ed.a4 = {
+      words: [
+        { str: words[0], cap: 540, wd: wd1, wid: wid1, base: B1, speed: 160 },
+        { str: words[1], cap: 135, wd: 1 - wd1, wid: wid2, base: B2, speed: 320 },
+        { str: words[2], cap: 34, wd: 1, wid: 1, base: B3, speed: 480 },
+      ],
+      red: Rl(ax, B1 + SUB, colX(6) - ax, 17, RED),
+      black: Rl(ax, B2 + SUB, colX(Math.min(6, axisCol + 2 + int(3))) - ax, 2, BLACK),
+    };
+  }
+
+  // ACT 5: the particle letter.
+  {
+    const letter = pick(uniqueLetters(w1));
+    const wid = prefer([0.45, 0.55, 0.7, 0.9], wi => edgeOK(T(letter, ax, H - M, 1080, 1, wi)));
+    ed.a5 = { letter, wid, base: H - M };
+  }
+
+  // ACT 6: the lockup, the edition's final composition.
+  {
+    const cap = pick([540, 1080, 1080]);
+    const wd = pick([0, 1, 1]);
+    const color = chance(0.3) ? RED : BLACK;
+    const bases = cap === 1080 ? [1215, 1620, 1755, 810, 675] : [675, 810, 945, 1080, 1215, 1485];
+    const wid = prefer([0.45, 0.7, 1, 1.3], wi => bases.some(b => edgeOK(T(w1, ax, b, cap, wd, wi))));
+    // leave room for the small group (about 2 rows) above or below the big word
+    const base = prefer(bases, b => edgeOK(T(w1, ax, b, cap, wd, wid)) && (b - cap >= rowY(3) || b <= rowY(5)));
+    const big = T(w1, ax, base, cap, wd, wid, color);
+    // The small group needs 6 quarter-cells of height, plus a rule above it.
+    const bigTop = base - cap, bigBot = base;
+    const candidates = [1, 2, 3, 4, 5, 6].map(rowY);
+    const free = candidates.filter(y0 => y0 + 6 * SUB < bigTop || y0 - 2 * SUB > bigBot);
+    const y0 = (free.length && chance(0.9)) ? pick(free) : pick(candidates);
+    const wd2 = pick([0, 1]);
+    const thick = pick([8, 17, 34]);
+    const capWid = pick([0.7, 1]);
+    ed.a6 = {
+      big,
+      smalls: [
+        T(words[1], ax, y0 + SUB, 34, wd2, 1),
+        T(words[2], ax, y0 + 3 * SUB, pick([34, 17]), 1 - wd2, 1),
+      ],
+      caption: [
+        T('EDITION ' + pad4(n), ax, y0 + 5 * SUB, 17, 1, capWid),
+        T('90 BPM / 4/4 / 16 S', ax, y0 + 6 * SUB, 17, 1, capWid),
+      ],
+      red: Rl(ax, y0 - (thick > 17 ? 2 : 1) * SUB, colX(axisCol + 1 + int(6 - axisCol)) - ax, thick, RED),
+      black: Rl(ax, y0 + 4 * SUB, colX(Math.min(6, axisCol + 2 + int(2))) - ax, 2, BLACK),
+    };
+  }
+
+  // The list of resting compositions the critic must check.
+  ed.comps = compositions(ed);
+  return ed;
+}
+
+// Collect every resting state (where nothing moves) as a list of elements.
+function compositions(ed) {
+  const out = [];
+  out.push({ name: 'GRID', els: [ed.a1.rule], contrast: false });
+  ed.a2.states.forEach(([wd, wid, m], i) => out.push({
+    name: 'DIAL ' + (i + 1), mustCrop: true, contrast: true,
+    els: [T(ed.a2.letter, ed.ax, ed.a2.base, 1080, wd, wid), ed.a2.small.text,
+      Rl(ed.ax, ed.a2.small.ruleY, colX(ed.axisCol + m) - ed.ax, 17, RED)],
+  }));
+  const a3 = ed.a3;
+  a3.seq.forEach((ch, i) => out.push({
+    name: 'MORPH ' + (i + 1), contrast: true,
+    els: [T(ch, ed.ax, a3.base, a3.cap, a3.wd, a3.wid), a3.small.text,
+      Rl(ed.ax, a3.small.ruleY, colX(Math.min(6, ed.axisCol + i + 1)) - ed.ax, 17, RED)],
+  }));
+  out.push({
+    name: 'DEPTH', contrast: true,
+    els: [...ed.a4.words.map(w => T(w.str, ed.ax, w.base, w.cap, w.wd, w.wid)), ed.a4.red, ed.a4.black],
+  });
+  out.push({ name: 'SWARM', contrast: false, els: [T(ed.a5.letter, ed.ax, ed.a5.base, 1080, 1, ed.a5.wid)] });
+  const a6 = ed.a6;
+  out.push({ name: 'LOCKUP', contrast: true, lockup: true, els: [a6.big, ...a6.smalls, ...a6.caption, a6.red, a6.black] });
+  return out;
+}
+
+
+/* ---------------------------------------------------------------------
+   6. THE CRITIC
+   Checks an edition against the RULES. Any failure = the edition is
+   thrown away and the next sub-seed is tried.
+   --------------------------------------------------------------------- */
+const CHECKS = ['GRID', 'TWO WEIGHTS', 'SIZE LADDER', 'ONE AXIS', 'RULES', 'EDGES', 'COLOURS', 'AVOID', 'SPACE'];
+
+function bbox(el) {
+  if (el.kind === 'text') {
+    return { x0: el.x, y0: el.base - el.cap, x1: el.x + measure(el.str, el.cap, el.wd, el.wid), y1: el.base };
+  }
+  return { x0: el.x, y0: el.y, x1: el.x + el.len, y1: el.y + el.thick };
+}
+// Share of a box's area that lies outside the 1080x1350 frame.
+function cropFraction(b) {
+  const area = (b.x1 - b.x0) * (b.y1 - b.y0);
+  if (area <= 0) return 0;
+  const vx = Math.max(0, Math.min(b.x1, W) - Math.max(b.x0, 0));
+  const vy = Math.max(0, Math.min(b.y1, H) - Math.max(b.y0, 0));
+  return 1 - (vx * vy) / area;
+}
+const insideLive = (b, tol = 1) => b.x0 >= LIVE.x0 - tol && b.x1 <= LIVE.x1 + tol && b.y0 >= LIVE.y0 - tol && b.y1 <= LIVE.y1 + tol;
+const overlaps = (a, b, pad = 4) => a.x0 < b.x1 + pad && b.x0 < a.x1 + pad && a.y0 < b.y1 + pad && b.y0 < a.y1 + pad;
+const onStep = (v, origin, step) => { const q = (v - origin) / step; return Math.abs(q - Math.round(q)) < 1e-6; };
+
+// What is wrong with an act 1 cell pattern (empty list = nothing).
+function patternFaults(cells) {
+  const out = [];
+  const filled = new Set(cells.map(c => c.c + ',' + c.r));
+  let isChecker0 = true, isChecker1 = true, diff = 0, pairs = 0;
+  for (let r = 0; r < 8; r++) for (let c = 0; c < 6; c++) {
+    const f = filled.has(c + ',' + r);
+    if (f !== ((c + r) % 2 === 0)) isChecker0 = false;
+    if (f !== ((c + r) % 2 === 1)) isChecker1 = false;
+    // neighbours that differ: a checkerboard has almost all of them different
+    if (c < 5) { pairs++; if (f !== filled.has((c + 1) + ',' + r)) diff++; }
+    if (r < 7) { pairs++; if (f !== filled.has(c + ',' + (r + 1))) diff++; }
+  }
+  if (isChecker0 || isChecker1) out.push('CHECKERBOARD');
+  else if (diff / pairs > 0.75) out.push('CHECKER-LIKE');
+  const ratio = cells.length / 48;
+  if (ratio < 0.2 || ratio > 0.6) out.push('FILL ' + Math.round(ratio * 100) + '%');
+  return out;
+}
+
+function critic(ed) {
+  const fails = {};
+  CHECKS.forEach(c => (fails[c] = []));
+  const fail = (rule, msg) => fails[rule].push(msg);
+
+  for (const comp of ed.comps) {
+    const texts = comp.els.filter(e => e.kind === 'text');
+    const rules = comp.els.filter(e => e.kind === 'rule');
+    for (const el of comp.els) {
+      const b = bbox(el);
+      if (!PALETTE.includes(el.color)) fail('COLOURS', comp.name);
+      if (el.kind === 'text') {
+        // GRID: left edge on a column line, baseline on the grid (big type) or quarter grid (small type)
+        if (!onStep(el.x, M, CELL)) fail('GRID', comp.name + ' X');
+        if (!onStep(el.base, M, el.cap >= CELL ? CELL : SUB)) fail('GRID', comp.name + ' BASELINE');
+        if (el.wd !== 0 && el.wd !== 1) fail('TWO WEIGHTS', comp.name);
+        if (!LADDER.includes(el.cap)) fail('SIZE LADDER', comp.name + ' ' + el.cap);
+        if (el.x !== ed.ax) fail('ONE AXIS', comp.name);
+        if (/^0\d$/.test(el.str.trim())) fail('AVOID', comp.name + ' LABEL');
+      } else {
+        if (!RULE_THICK.includes(el.thick)) fail('RULES', comp.name + ' THICKNESS');
+        if (el.color !== RED && el.color !== BLACK) fail('RULES', comp.name + ' COLOUR');
+        if (!onStep(el.x, M, CELL) || !onStep(el.x + el.len, M, CELL) || !onStep(el.y, M, SUB)) fail('GRID', comp.name + ' RULE');
+        if (el.len <= 0) fail('RULES', comp.name + ' LENGTH');
+      }
+      // EDGES: inside the margins, or cropped by the frame by at least 25%.
+      const cf = cropFraction(b);
+      if (comp.mustCrop && el.kind === 'text' && el.cap >= 540 && cf < 0.25 - 1e-6) fail('EDGES', comp.name + ' NOT CROPPED');
+      if (!insideLive(b) && cf < 0.25 - 1e-6) fail('EDGES', comp.name + (el.kind === 'rule' ? ' RULE' : ' ' + el.str));
+    }
+    // SIZE LADDER: one size of 540 or more against one of 34 or less.
+    if (comp.contrast) {
+      const caps = texts.map(e => e.cap);
+      if (!(caps.some(c => c >= 540) && caps.some(c => c <= 34))) fail('SIZE LADDER', comp.name + ' CONTRAST');
+    }
+    // SPACE: text blocks never collide; rules never cut through text smaller than 540.
+    const boxes = texts.map(e => ({ e, b: bbox(e) }));
+    for (let i = 0; i < boxes.length; i++) for (let j = i + 1; j < boxes.length; j++)
+      if (overlaps(boxes[i].b, boxes[j].b)) fail('SPACE', comp.name + ' TEXT');
+    for (const r of rules) for (const t of boxes)
+      if (t.e.cap < 540 && overlaps(bbox(r), t.b, 2)) fail('SPACE', comp.name + ' RULE');
+    if (comp.lockup) {
+      if (!rules.some(r => r.color === RED)) fail('RULES', 'LOCKUP NEEDS RED');
+      // Rag-right: the caption lines must not be the same length (never justified).
+      const cw = comp.els.filter(e => e.kind === 'text' && e.cap === 17 && e.str.length > 10).map(e => measure(e.str, e.cap, e.wd, e.wid));
+      if (cw.length === 2 && Math.abs(cw[0] - cw[1]) < 20) fail('ONE AXIS', 'JUSTIFIED');
+    }
+  }
+
+  // AVOID: the act 1 pattern must be ordered but never a (near) checkerboard.
+  patternFaults(ed.cells).forEach(f => fail('AVOID', f));
+
+  const results = CHECKS.map(c => ({ rule: c, ok: fails[c].length === 0, why: fails[c] }));
+  return { pass: results.every(r => r.ok), results };
+}
+
+// Try sub-seeds 0, 1, 2 ... until the critic accepts one (deterministic).
+const editionCache = new Map();
+function makeEdition(n) {
+  if (editionCache.has(n)) return editionCache.get(n);
+  const rejected = [];
+  let ed = null;
+  for (let a = 0; a < 400; a++) {
+    const cand = generate(n, a), verdict = critic(cand);
+    if (verdict.pass) { ed = cand; ed.verdict = verdict; break; }
+    rejected.push({ attempt: a, failed: verdict.results.filter(r => !r.ok).map(r => r.rule) });
+  }
+  if (!ed) { ed = generate(1, 0); ed.n = n; ed.verdict = critic(ed); }   // safety net, never expected
+  ed.rejected = rejected;
+  if (editionCache.size > 50) editionCache.clear();
+  editionCache.set(n, ed);
+  return ed;
+}
+
+
+/* ---------------------------------------------------------------------
+   7. DRAWING
+   Three layer canvases, each the size of the screen in device pixels:
+     back  - the grid (blurred slightly by the finish)
+     mid   - black type and cells
+     front - red rules and red type
+   They are combined like ink on paper: multiply.
+   --------------------------------------------------------------------- */
+const view = document.getElementById('view');
+const ui = document.getElementById('ui');
+const L = {};
+['back', 'mid', 'front'].forEach(name => {
+  const c = document.createElement('canvas');
+  L[name] = { canvas: c, ctx: c.getContext('2d') };
+});
+let pxW = 1080, pxH = 1350, K = 1;      // device pixels and device pixels per stage pixel
+let ED = null;                          // the current edition
+let backKey = '';                       // what the back layer currently shows (redrawn only on change)
+
+// Reset a layer: clear it and set the transform so we can draw in stage pixels.
+function begin(ctx) {
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.globalAlpha = 1;
+  ctx.clearRect(0, 0, pxW, pxH);
+  ctx.setTransform(K, 0, 0, K, 0, 0);
+}
+
+// Back-layer drawings ---------------------------------------------------
+function drawGridLines(ctx, ta) {
+  // The first beat starts from plain white and lands late: the lines grow from t=0.
+  ctx.fillStyle = BLACK;
+  for (let i = 0; i <= 6; i++) {
+    const p = easeInOut(clamp01((ta - i * 0.03) / 0.42));
+    ctx.fillRect(colX(i) - 1, M, 2, (H - 2 * M) * p);
+  }
+  for (let j = 0; j <= 8; j++) {
+    const p = easeInOut(clamp01((ta - 0.06 - j * 0.025) / 0.42));
+    ctx.fillRect(M, rowY(j) - 1, (W - 2 * M) * p, 2);
+  }
+}
+function drawCrosses(ctx, act) {
+  // Small registration crosses at the grid points: the grid, quietly.
+  // Crosses that would sit inside small text are left out, so the type stays clean.
+  const comp = ED.comps.find(c => c.name === ['', 'DIAL 1', 'MORPH 1', 'DEPTH', '', 'LOCKUP'][act]);
+  const boxes = comp ? comp.els.filter(e => e.kind === 'text' && e.cap <= 135).map(bbox) : [];
+  const hit = (x, y) => boxes.some(b => x > b.x0 - 14 && x < b.x1 + 14 && y > b.y0 - 14 && y < b.y1 + 14);
+  ctx.fillStyle = BLACK;
+  for (let i = 0; i <= 6; i++) for (let j = 0; j <= 8; j++) {
+    if (hit(colX(i), rowY(j))) continue;
+    ctx.fillRect(colX(i) - 8, rowY(j) - 1, 16, 2);
+    ctx.fillRect(colX(i) - 1, rowY(j) - 8, 2, 16);
+  }
+}
+const drawRule = (ctx, r, k = 1) => { ctx.fillStyle = r.color; ctx.fillRect(r.x, r.y, r.len * k, r.thick); };
+
+// ACT 1: GRID ------------------------------------------------------------
+function act1(ta) {
+  const ed = ED, mid = L.mid.ctx, front = L.front.ctx;
+  mid.fillStyle = BLACK;
+  for (const cell of ed.cells) {
+    const b = cell.r < 3 ? 1 : cell.r < 6 ? 2 : 3;          // rows 1-3 on beat 2, 4-6 on beat 3, 7-8 on beat 4
+    const p = land(ta, b * BEAT, 0.12);
+    if (p <= 0) continue;
+    const s = p * CELL, cx = colX(cell.c) + CELL / 2, cy = rowY(cell.r) + CELL / 2;
+    mid.fillRect(cx - s / 2, cy - s / 2, s, s);
+  }
+  const tb = 3 * BEAT;
+  blurDraw(front, ta, inMove(ta, tb, 0.15), t => {
+    const p = land(t, tb, 0.15);
+    if (p > 0) drawRule(front, ed.a1.rule, p);
+  });
+}
+
+// ACT 2: DIAL ------------------------------------------------------------
+function dialAt(ta) {
+  const S = ED.a2.states;
+  let wd = S[0][0], wid = S[0][1], m = S[0][2];
+  for (let b = 1; b < 4; b++) {
+    const p = land(ta, b * BEAT, 0.16);
+    wd += (S[b][0] - S[b - 1][0]) * p;
+    wid += (S[b][1] - S[b - 1][1]) * p;
+    m += (S[b][2] - S[b - 1][2]) * p;
+  }
+  return { wd: clamp01(wd), wid: Math.max(0.3, wid), m };
+}
+function act2(ta) {
+  const ed = ED, a = ed.a2, mid = L.mid.ctx, front = L.front.ctx;
+  const moving = [1, 2, 3].some(b => inMove(ta, b * BEAT, 0.16));
+  blurDraw(mid, ta, moving, t => {
+    const d = dialAt(t);
+    drawText(mid, a.letter, ed.ax, a.base, 1080, d.wd, d.wid, BLACK, false);
+  });
+  const s = a.small.text;
+  drawText(mid, s.str, s.x, s.base, s.cap, s.wd, s.wid, BLACK);
+  blurDraw(front, ta, moving, t => {
+    const d = dialAt(t);
+    front.fillStyle = RED;
+    front.fillRect(ed.ax, a.small.ruleY, CELL * d.m, 17);
+  });
+}
+
+// ACT 3: MORPH -----------------------------------------------------------
+function act3(ta) {
+  const ed = ED, a = ed.a3, mid = L.mid.ctx, front = L.front.ctx;
+  const lead = 0.28;
+  const moving = [1, 2, 3].some(b => inMove(ta, b * BEAT, lead));
+  const state = t => {
+    let cur = 0, k = 0;
+    for (let b = 1; b < 4; b++) { const p = land(t, b * BEAT, lead); if (p > 0) { cur = b - 1; k = p; } }
+    return { cur, k: Math.min(k, 1.08) };
+  };
+  blurDraw(mid, ta, moving, t => {
+    const s = state(t);
+    drawMorph(mid, a.seq[s.cur], a.seq[Math.min(3, s.cur + 1)], s.k, ed.ax, a.base, a.cap, a.wd, a.wid, BLACK);
+  });
+  const s = a.small.text;
+  drawText(mid, s.str, s.x, s.base, s.cap, s.wd, s.wid, BLACK);
+  // The red rule grows one column per beat: a progress bar on the grid.
+  blurDraw(front, ta, moving, t => {
+    const st = state(t);
+    const cols = Math.min(6 - ed.axisCol, st.cur + 1 + st.k);
+    front.fillStyle = RED;
+    front.fillRect(ed.ax, a.small.ruleY, CELL * Math.min(cols, 6 - ed.axisCol + 0.05), 17);
+  });
+}
+
+// ACT 4: DEPTH -----------------------------------------------------------
+/* The three words are pre-drawn into images once per edition. Here they are
+   painted onto a plane that turns around a vertical hinge on the axis.
+   Our own perspective maths: a point at depth z shrinks towards the
+   vanishing point by f / (f + z). The plane is cut into thin vertical
+   strips; each strip is drawn at its own scale. */
+const FOCAL = 2000;
+function act4(ta) {
+  const ed = ED, a = ed.a4, mid = L.mid.ctx, front = L.front.ctx;
+  const vpx = Math.min(W + 150, ed.ax + 800), vpy = H / 2;
+  const b2 = BEAT, b3 = 2 * BEAT, b4 = 3 * BEAT;
+  // swing angle: 90 degrees (plane runs into the depth) until it swings shut on beat 3
+  const phiAt = t => (Math.PI / 2) * (1 - land(t, b3, 0.4, 0.07, 16, 7));
+  // parallax: each word slides along the plane at its own speed, in two steps
+  const offAt = (t, v) => 2 * v - v * land(t, b2, 0.2) - v * land(t, b3, 0.2);
+  const moving = inMove(ta, b2, 0.2) || inMove(ta, b3, 0.4);
+  blurDraw(mid, ta, moving, t => {
+    const phi = phiAt(t), cs = Math.cos(phi), sn = Math.sin(phi);
+    a.words.forEach((w, i) => {
+      const img = WORDIMG[i];
+      if (!img) return;
+      const d = offAt(t, w.speed);
+      const top = w.base - img.asc, hgt = img.hStage;
+      if (Math.abs(phi) < 0.002) {     // flat: one simple draw
+        mid.drawImage(img.canvas, ed.ax + d, top, img.wStage, hgt);
+        return;
+      }
+      const strips = 72;
+      for (let j = 0; j < strips; j++) {
+        const xa = img.wStage * j / strips, xb = img.wStage * (j + 1) / strips;
+        const pa = project(ed.ax, xa + d, cs, sn, vpx), pb = project(ed.ax, xb + d, cs, sn, vpx);
+        if (!pa || !pb) continue;
+        const sm = (pa.s + pb.s) / 2;
+        const dx = pa.x, dw = pb.x - pa.x;
+        if (dw <= 0.01 || dx > W + 5 || dx + dw < -5) continue;
+        const dy = vpy + (top - vpy) * sm;
+        mid.drawImage(img.canvas, xa * img.k, 0, (xb - xa) * img.k, img.canvas.height, dx, dy, dw + 0.6, hgt * sm);
+      }
+    });
+  });
+  // Beat 4: the rules slam in and anchor the block.
+  const rp = land(ta, b4, 0.15);
+  if (rp > 0) {
+    blurDraw(front, ta, inMove(ta, b4, 0.15), t => drawRule(front, a.red, land(t, b4, 0.15)));
+    blurDraw(mid, ta, inMove(ta, b4, 0.15), t => drawRule(mid, a.black, land(t, b4, 0.15)));
+  }
+}
+// Project a point X along the plane (hinged at x = hinge) to the screen.
+function project(hinge, X, cs, sn, vpx) {
+  const x = hinge + X * cs, z = X * sn;
+  if (FOCAL + z < 60) return null;
+  const s = FOCAL / (FOCAL + z);
+  return { x: vpx + (x - vpx) * s, s };
+}
+
+// ACT 5: SWARM -----------------------------------------------------------
+/* Each particle has three homes: a grid dot, a point inside a letter, and a
+   spot inside a grid module. Its position is a pure formula of time:
+   dots -> letter (beat 2) -> modules (beat 3) -> dots (beat 4).
+   The GPU version runs the same formula in a vertex shader. */
+function particleAt(P, i, tau, out) {
+  const o = i * 9;
+  const dx = P[o], dy = P[o + 1], lx = P[o + 2], ly = P[o + 3], mx = P[o + 4], my = P[o + 5], r1 = P[o + 6], r2 = P[o + 7];
+  const p1 = land(tau, BEAT, 0.22 + 0.3 * r1), p2 = land(tau, 2 * BEAT, 0.18 + 0.25 * r2), p3 = land(tau, 3 * BEAT, 0.1 + 0.08 * r1);
+  let x = dx + (lx - dx) * p1 + (mx - lx) * p2 + (dx - mx) * p3;
+  let y = dy + (ly - dy) * p1 + (my - ly) * p2 + (dy - my) * p3;
+  // swirl on the way into the letter
+  let vx = lx - dx, vy = ly - dy; const vl = Math.hypot(vx, vy) || 1;
+  const sw = Math.sin(Math.PI * clamp01(p1)) * (60 + 200 * r2) / vl;
+  x += -vy * sw; y += vx * sw;
+  // burst on the way out of the letter
+  let bx = lx - SW_CENTER[0], by = ly - SW_CENTER[1]; const bl = Math.hypot(bx, by) || 1;
+  const bu = Math.sin(Math.PI * clamp01(p2)) * (120 + 320 * r1) / bl;
+  x += bx * bu; y += by * bu;
+  // a pop in size on beat 1 and beat 4
+  const t0 = r1 * 0.12;
+  let size = 1;
+  if (tau >= t0) size += 1.4 * Math.exp(-9 * (tau - t0));
+  if (tau >= 3 * BEAT) size += 0.9 * Math.exp(-9 * (tau - 3 * BEAT));
+  out.x = x; out.y = y; out.size = size; out.red = P[o + 8];
+}
+let SW_CENTER = [540, 675];
+function act5(ta) {
+  const ed = ED, mid = L.mid.ctx;
+  const moving = [1, 2, 3].some(b => inMove(ta, b * BEAT, 0.5));
+  if (GPU) { GPU.swarmTau = ta; GPU.swarmMoving = moving; return; }   // drawn on the GPU
+  // Canvas fallback: fewer particles, same formula.
+  const P = PARTS.data, n = PARTS.count, o = { x: 0, y: 0, size: 1, red: 0 };
+  blurDraw(mid, ta, moving, t => {
+    for (let i = 0; i < n; i++) {
+      particleAt(P, i, t, o);
+      const s = 5.5 * o.size;
+      mid.fillStyle = o.red > 0.5 ? RED : BLACK;
+      mid.fillRect(o.x - s / 2, o.y - s / 2, s, s);
+    }
+  });
+}
+
+// ACT 6: LOCKUP ----------------------------------------------------------
+function act6(ta) {
+  const ed = ED, a = ed.a6, mid = L.mid.ctx, front = L.front.ctx;
+  const b2 = BEAT, b3 = 2 * BEAT;
+  const bigCtx = a.big.color === RED ? front : mid;     // red type lives on the front layer
+  drawText(bigCtx, a.big.str, a.big.x, a.big.base, a.big.cap, a.big.wd, a.big.wid, a.big.color);
+  // Beat 2: the red rule and the two small words land (they rise into place).
+  blurDraw(front, ta, inMove(ta, b2, 0.2), t => { const p = land(t, b2, 0.2); if (p > 0) drawRule(front, a.red, p); });
+  blurDraw(mid, ta, inMove(ta, b2, 0.18), t => {
+    const p = land(t, b2, 0.18);
+    if (p <= 0) return;
+    a.smalls.forEach(s => drawText(mid, s.str, s.x, s.base + SUB * (1 - p), s.cap, s.wd, s.wid, BLACK));
+  });
+  // Beat 3: the caption and the black rule land.
+  blurDraw(mid, ta, inMove(ta, b3, 0.18), t => {
+    const p = land(t, b3, 0.18);
+    if (p <= 0) return;
+    drawRule(mid, a.black, p);
+    a.caption.forEach(s => drawText(mid, s.str, s.x, s.base + SUB * (1 - p), s.cap, s.wd, s.wid, BLACK));
+  });
+}
+
+// The camera of act 6: a slow push for three beats, then a wipe to white.
+function act6View(ta) {
+  const push = 1 + 0.035 * easeInOut(clamp01(ta / (3 * BEAT)));
+  const wipe = ta < 3 * BEAT ? 0 : easeInCubic(clamp01((ta - 3 * BEAT) / 0.38)) * (W + 40);
+  return { push, wipe };
+}
+
+// Draw all three layers for time t.
+const ACTS = [act1, act2, act3, act4, act5, act6];
+function renderLayers(t) {
+  const act = Math.min(5, Math.floor(t / BAR));
+  const ta = t - act * BAR;
+  const v = act === 5 ? act6View(ta) : { push: 1, wipe: 0 };
+  const px = ED.ax, py = ED.a6.big.base;            // the push grows from the axis
+  const setView = ctx => {
+    ctx.setTransform(K * v.push, 0, 0, K * v.push, K * px * (1 - v.push), K * py * (1 - v.push));
+    if (v.wipe > 0) { ctx.beginPath(); ctx.rect(v.wipe - 20, -2000, 5000, 5000); ctx.clip(); }
+  };
+  // Back layer: redrawn only when it changes (saves work on phones).
+  const key = act === 0 ? (ta < 0.8 ? 'g' + ta.toFixed(4) : 'grid') : act === 5 ? 'x' + v.push.toFixed(5) + v.wipe.toFixed(2) : 'cross' + act;
+  let backChanged = false;
+  if (key !== backKey) {
+    const b = L.back.ctx;
+    begin(b); b.save(); setView(b);
+    if (act === 0) drawGridLines(b, ta); else drawCrosses(b, act);
+    b.restore();
+    backKey = key; backChanged = true;
+  }
+  for (const name of ['mid', 'front']) { const c = L[name].ctx; begin(c); c.save(); setView(c); }
+  if (!(act === 5 && v.wipe > W)) ACTS[act](ta);
+  for (const name of ['mid', 'front']) L[name].ctx.restore();
+  return { act, ta, backChanged };
+}
+
+
+/* ---------------------------------------------------------------------
+   Per-edition preparation: word images for act 4, particles for act 5.
+   --------------------------------------------------------------------- */
+let WORDIMG = [];
+let PARTS = { data: null, count: 0 };
+function prepareWordImages(ed) {
+  WORDIMG = ed.a4.words.map(w => {
+    const full = measure(w.str, w.cap, w.wd, w.wid);
+    const wStage = Math.min(full, 2700);               // further than this is never seen
+    const asc = w.cap * 1.1, hStage = w.cap * 1.12;     // a little room for sharp apexes
+    const k = Math.min(K, 4096 / wStage, 4096 / hStage);
+    const c = document.createElement('canvas');
+    c.width = Math.ceil(wStage * k); c.height = Math.ceil(hStage * k);
+    const ctx = c.getContext('2d');
+    ctx.setTransform(k, 0, 0, k, 0, 0);
+    drawText(ctx, w.str, 0, asc, w.cap, w.wd, w.wid, BLACK, true, wStage + 60);
+    return { canvas: c, k, wStage, hStage, asc };
+  });
+}
+function prepareParticles(ed, count) {
+  const R = mulberry32(ed.seed ^ 0xa11ce);
+  // 1. Draw the swarm letter small and read back which pixels are ink.
+  const S = 0.25, c = document.createElement('canvas');
+  c.width = Math.ceil(W * S); c.height = Math.ceil(H * S);
+  const ctx = c.getContext('2d', { willReadFrequently: true });
+  ctx.setTransform(S, 0, 0, S, 0, 0);
+  drawText(ctx, ed.a5.letter, ed.ax, ed.a5.base, 1080, 1, ed.a5.wid, '#000');
+  const img = ctx.getImageData(0, 0, c.width, c.height).data, inside = [];
+  for (let i = 0; i < c.width * c.height; i++) if (img[i * 4 + 3] > 128) inside.push(i);
+  // 2. The grid modules are the cells filled in act 1.
+  const cells = ed.cells.length ? ed.cells : [{ c: 2, r: 3 }];
+  const per = Math.ceil(count / cells.length), side = Math.ceil(Math.sqrt(per));
+  const data = new Float32Array(count * 9);
+  let cx = 0, cy = 0;
+  for (let i = 0; i < count; i++) {
+    const o = i * 9;
+    const dot = i % (25 * 33);                               // 25 x 33 dots on the quarter grid
+    data[o] = M + (dot % 25) * SUB; data[o + 1] = M + Math.floor(dot / 25) * SUB;
+    const pix = inside.length ? inside[Math.floor(R() * inside.length)] : 0;
+    data[o + 2] = ((pix % c.width) + R()) / S; data[o + 3] = (Math.floor(pix / c.width) + R()) / S;
+    cx += data[o + 2]; cy += data[o + 3];
+    const cell = cells[i % cells.length], slot = Math.floor(i / cells.length);
+    const step = (CELL - 24) / side;
+    data[o + 4] = colX(cell.c) + 12 + (slot % side + 0.5) * step;
+    data[o + 5] = rowY(cell.r) + 12 + (Math.floor(slot / side) + 0.5) * step;
+    data[o + 6] = R(); data[o + 7] = R();
+    data[o + 8] = R() < 0.12 ? 1 : 0;                        // about one in eight is red
+  }
+  SW_CENTER = [cx / count, cy / count];
+  PARTS = { data, count };
+}
+
+
+/* ---------------------------------------------------------------------
+   8. GPU FINISH (WebGL2)
+   The three layer canvases are uploaded as textures. A fragment shader
+   multiplies them like inks on paper, blurs the back layer slightly
+   (depth of field), turns soft edges into a fine line screen, and adds
+   paper grain. The particle swarm is drawn by the GPU into its own
+   texture first. Without WebGL2 we fall back to a plain 2D composite.
+   --------------------------------------------------------------------- */
+let GPU = null;
+let FINISH = true;
+const PARTICLES_GPU = 8000, PARTICLES_CANVAS = 1400;
+
+const VS_QUAD = `#version 300 es
+layout(location=0) in vec2 aPos;
+out vec2 vUv;
+void main(){ vUv = aPos * 0.5 + 0.5; gl_Position = vec4(aPos, 0.0, 1.0); }`;
+
+const FS_COMPOSITE = `#version 300 es
+precision highp float;
+in vec2 vUv;
+out vec4 outColor;
+uniform sampler2D uBack, uMid, uFront, uPart;
+uniform vec2 uRes;      // canvas size in device pixels
+uniform float uK;       // device pixels per stage pixel
+uniform float uFinish;  // 1 = print finish on
+const vec3 INK_K = vec3(17.0) / 255.0;
+const vec3 INK_R = vec3(227.0, 6.0, 19.0) / 255.0;
+
+// cheap repeatable noise from a pixel position
+float hash(vec2 p){ p = fract(p * vec2(443.897, 441.423)); p += dot(p, p.yx + 19.19); return fract((p.x + p.y) * p.x); }
+
+// Line screen: turn a coverage value (0..1) into lines whose width follows it.
+float screenLine(float a, float ang, float period){
+  if (a < 0.004) return 0.0;
+  if (a > 0.985) return 1.0;
+  vec2 d = vec2(cos(ang), sin(ang));
+  float s = dot(gl_FragCoord.xy, d) / period;
+  float dist = abs(fract(s) - 0.5) * 2.0;
+  return clamp((a - dist) / (2.0 / period) + 0.5, 0.0, 1.0);
+}
+// One ink layer: how much it darkens the paper (multiply factor).
+vec3 ink(vec4 c, float ang, float period){
+  float a = c.a;
+  if (a < 0.0005) return vec3(1.0);
+  vec3 col = c.rgb / a;
+  // a negative angle means: keep this layer's edges clean (no screen)
+  if (uFinish > 0.5 && ang > 0.0) a = screenLine(a, ang, period);
+  return mix(vec3(1.0), col, a);
+}
+void main(){
+  vec4 b;
+  if (uFinish > 0.5) {
+    // depth of field: a small 9-tap blur on the back layer only
+    vec2 px = 1.3 * uK / uRes;
+    b  = texture(uBack, vUv) * 0.25;
+    b += (texture(uBack, vUv + vec2(px.x, 0.0)) + texture(uBack, vUv - vec2(px.x, 0.0)) +
+          texture(uBack, vUv + vec2(0.0, px.y)) + texture(uBack, vUv - vec2(0.0, px.y))) * 0.125;
+    b += (texture(uBack, vUv + px) + texture(uBack, vUv - px) +
+          texture(uBack, vUv + vec2(px.x, -px.y)) + texture(uBack, vUv - vec2(px.x, -px.y))) * 0.0625;
+  } else {
+    b = texture(uBack, vUv);
+  }
+  float period = max(3.0, 2.6 * uK);
+  vec3 col = ink(b, 0.785, period) * ink(texture(uMid, vUv), -1.0, period) * ink(texture(uFront, vUv), -1.0, period);
+  // particles: red channel = black ink coverage, green channel = red ink coverage
+  vec4 q = texture(uPart, vUv);
+  float qk = q.r, qr = q.g;
+  if (uFinish > 0.5) { qk = screenLine(qk, 1.309, period); qr = screenLine(qr, 0.262, period); }
+  col *= mix(vec3(1.0), INK_K, qk) * mix(vec3(1.0), INK_R, qr);
+  if (uFinish > 0.5) {
+    // paper grain: fine speckle plus a slightly coarser fibre
+    float g1 = hash(gl_FragCoord.xy), g2 = hash(floor(gl_FragCoord.xy / 3.0) + 17.0);
+    col *= 1.0 - 0.035 * g1 - 0.02 * g2;
+    // ink is never perfectly flat: lift the darkest areas a touch, unevenly
+    col += (1.0 - col) * 0.06 * hash(floor(gl_FragCoord.xy / 2.0) + 3.0) * step(col.g, 0.5);
+  }
+  outColor = vec4(col, 1.0);
+}`;
+
+const VS_PART = `#version 300 es
+layout(location=0) in vec4 aA;   // dot.xy, letter.xy
+layout(location=1) in vec4 aB;   // module.xy, two random numbers
+layout(location=2) in float aRed;
+uniform float uTau, uSize;
+uniform vec2 uCenter;
+out float vRed;
+const float B = 2.0 / 3.0;
+float land(float t, float tb, float lead){
+  if (t < tb - lead) return 0.0;
+  if (t < tb) { float u = (t - tb + lead) / lead; return u * u * u; }
+  float s = t - tb; return 1.0 + 0.09 * exp(-8.0 * s) * sin(22.0 * s);
+}
+void main(){
+  vec2 d = aA.xy, l = aA.zw, m = aB.xy; float r1 = aB.z, r2 = aB.w;
+  float p1 = land(uTau, B, 0.22 + 0.3 * r1), p2 = land(uTau, 2.0 * B, 0.18 + 0.25 * r2), p3 = land(uTau, 3.0 * B, 0.1 + 0.08 * r1);
+  vec2 pos = d + (l - d) * p1 + (m - l) * p2 + (d - m) * p3;
+  vec2 v = l - d; float vl = max(length(v), 1.0);
+  pos += vec2(-v.y, v.x) * (sin(3.14159265 * clamp(p1, 0.0, 1.0)) * (60.0 + 200.0 * r2) / vl);
+  vec2 bo = l - uCenter; float bl = max(length(bo), 1.0);
+  pos += bo * (sin(3.14159265 * clamp(p2, 0.0, 1.0)) * (120.0 + 320.0 * r1) / bl);
+  float t0 = r1 * 0.12, size = 1.0;
+  if (uTau >= t0) size += 1.4 * exp(-9.0 * (uTau - t0));
+  if (uTau >= 3.0 * B) size += 0.9 * exp(-9.0 * (uTau - 3.0 * B));
+  gl_Position = vec4(pos.x / 540.0 - 1.0, 1.0 - pos.y / 675.0, 0.0, 1.0);
+  gl_PointSize = uSize * size;
+  vRed = aRed;
+}`;
+
+const FS_PART = `#version 300 es
+precision mediump float;
+in float vRed;
+uniform float uAlpha;
+out vec4 o;
+void main(){ o = vRed > 0.5 ? vec4(0.0, uAlpha, 0.0, uAlpha) : vec4(uAlpha, 0.0, 0.0, uAlpha); }`;
+
+function initGPU(canvas) {
+  let gl = null;
+  try { gl = canvas.getContext('webgl2', { alpha: false, antialias: false, depth: false, stencil: false, premultipliedAlpha: false }); } catch (e) { gl = null; }
+  if (!gl) return null;
+  try {
+    const sh = (type, src) => {
+      const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s);
+      if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
+      return s;
+    };
+    const prog = (vs, fs) => {
+      const p = gl.createProgram();
+      gl.attachShader(p, sh(gl.VERTEX_SHADER, vs)); gl.attachShader(p, sh(gl.FRAGMENT_SHADER, fs));
+      gl.linkProgram(p);
+      if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+      return p;
+    };
+    const g = { gl, comp: prog(VS_QUAD, FS_COMPOSITE), part: prog(VS_PART, FS_PART) };
+    // full-screen quad
+    g.quad = gl.createVertexArray(); gl.bindVertexArray(g.quad);
+    const qb = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, qb);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), gl.STATIC_DRAW);
+    gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+    // particle buffer (filled per edition)
+    g.pvao = gl.createVertexArray(); gl.bindVertexArray(g.pvao);
+    g.pbuf = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, g.pbuf);
+    gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 4, gl.FLOAT, false, 36, 0);
+    gl.enableVertexAttribArray(1); gl.vertexAttribPointer(1, 4, gl.FLOAT, false, 36, 16);
+    gl.enableVertexAttribArray(2); gl.vertexAttribPointer(2, 1, gl.FLOAT, false, 36, 32);
+    gl.bindVertexArray(null);
+    const tex = () => {
+      const t = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, t);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+      return t;
+    };
+    g.tBack = tex(); g.tMid = tex(); g.tFront = tex(); g.tPart = tex();
+    g.fbo = gl.createFramebuffer();
+    g.partDirty = true;
+    const loc = (p, n) => gl.getUniformLocation(p, n);
+    g.u = {
+      back: loc(g.comp, 'uBack'), mid: loc(g.comp, 'uMid'), front: loc(g.comp, 'uFront'), partT: loc(g.comp, 'uPart'),
+      res: loc(g.comp, 'uRes'), k: loc(g.comp, 'uK'), finish: loc(g.comp, 'uFinish'),
+      tau: loc(g.part, 'uTau'), size: loc(g.part, 'uSize'), center: loc(g.part, 'uCenter'), alpha: loc(g.part, 'uAlpha'),
+    };
+    return g;
+  } catch (e) {
+    console.warn('WebGL2 setup failed, using the canvas composite:', e);
+    return null;
+  }
+}
+function gpuResize() {
+  const gl = GPU.gl;
+  gl.bindTexture(gl.TEXTURE_2D, GPU.tPart);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, pxW, pxH, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, GPU.fbo);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, GPU.tPart, 0);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  GPU.partDirty = true;
+}
+function gpuUpload(tex, canvas) {
+  const gl = GPU.gl;
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+  gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, true);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, canvas);
+}
+function gpuParticles(drawThem) {
+  const gl = GPU.gl;
+  gl.bindFramebuffer(gl.FRAMEBUFFER, GPU.fbo);
+  gl.viewport(0, 0, pxW, pxH);
+  gl.clearColor(0, 0, 0, 0); gl.clear(gl.COLOR_BUFFER_BIT);
+  if (drawThem) {
+    gl.useProgram(GPU.part);
+    gl.bindVertexArray(GPU.pvao);
+    gl.enable(gl.BLEND); gl.blendEquation(gl.MAX);   // overlapping particles never add up
+    gl.uniform1f(GPU.u.size, 3.6 * K);
+    gl.uniform2f(GPU.u.center, SW_CENTER[0], SW_CENTER[1]);
+    const n = GPU.swarmMoving ? 3 : 1;               // motion blur: earlier moments drawn fainter
+    for (let i = 0; i < n; i++) {
+      gl.uniform1f(GPU.u.tau, n === 1 ? GPU.swarmTau : GPU.swarmTau - (1 / 60) * (n - 1 - i) / (n - 1));
+      gl.uniform1f(GPU.u.alpha, (i + 1) / n);
+      gl.drawArrays(gl.POINTS, 0, PARTICLES_GPU);
+    }
+    gl.disable(gl.BLEND); gl.blendEquation(gl.FUNC_ADD);
+    gl.bindVertexArray(null);
+  }
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+}
+function gpuComposite(info) {
+  const gl = GPU.gl;
+  if (info.backChanged) gpuUpload(GPU.tBack, L.back.canvas);
+  gpuUpload(GPU.tMid, L.mid.canvas);
+  gpuUpload(GPU.tFront, L.front.canvas);
+  if (info.act === 4) { gpuParticles(true); GPU.partDirty = true; }
+  else if (GPU.partDirty) { gpuParticles(false); GPU.partDirty = false; }
+  gl.viewport(0, 0, pxW, pxH);
+  gl.useProgram(GPU.comp);
+  gl.bindVertexArray(GPU.quad);
+  [[GPU.tBack, GPU.u.back], [GPU.tMid, GPU.u.mid], [GPU.tFront, GPU.u.front], [GPU.tPart, GPU.u.partT]].forEach(([t, u], i) => {
+    gl.activeTexture(gl.TEXTURE0 + i); gl.bindTexture(gl.TEXTURE_2D, t); gl.uniform1i(u, i);
+  });
+  gl.activeTexture(gl.TEXTURE0);
+  gl.uniform2f(GPU.u.res, pxW, pxH);
+  gl.uniform1f(GPU.u.k, K);
+  gl.uniform1f(GPU.u.finish, FINISH ? 1 : 0);
+  gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+  gl.bindVertexArray(null);
+}
+// Without WebGL2: paper white, then each layer multiplied on top (the clean composite).
+let VIEW2D = null;
+function canvasComposite() {
+  const c = VIEW2D;
+  c.setTransform(1, 0, 0, 1, 0, 0);
+  c.globalCompositeOperation = 'source-over';
+  c.fillStyle = WHITE; c.fillRect(0, 0, pxW, pxH);
+  c.globalCompositeOperation = 'multiply';
+  c.drawImage(L.back.canvas, 0, 0); c.drawImage(L.mid.canvas, 0, 0); c.drawImage(L.front.canvas, 0, 0);
+  c.globalCompositeOperation = 'source-over';
+}
+
+
+/* ---------------------------------------------------------------------
+   9. MAIN LOOP, KEYS, API
+   --------------------------------------------------------------------- */
+const params = new URLSearchParams(location.search);
+let editionN = Math.max(1, parseInt(params.get('seed') || '1', 10) || 1);
+let tNow = 0, playing = true, lastNow = null;
+let showDebug = false, showCritic = false;
+let nextEd = null;
+
+function useEdition(ed) {
+  ED = ed;
+  prepareWordImages(ed);
+  prepareParticles(ed, GPU ? PARTICLES_GPU : PARTICLES_CANVAS);
+  if (GPU) {
+    const gl = GPU.gl;
+    gl.bindBuffer(gl.ARRAY_BUFFER, GPU.pbuf);
+    gl.bufferData(gl.ARRAY_BUFFER, PARTS.data, gl.STATIC_DRAW);
+  }
+  backKey = '';
+  try { history.replaceState(null, '', '?seed=' + ed.n); } catch (e) { /* not allowed in some frames */ }
+}
+function setEdition(n) {
+  editionN = Math.max(1, n | 0);
+  useEdition(makeEdition(editionN));
+  nextEd = null;
+}
+
+// Draw the whole picture for time t (seconds into the loop).
+function drawFrame(t) {
+  const info = renderLayers(t);
+  if (GPU) gpuComposite(info); else canvasComposite();
+  drawUI(t);
+  return info;
+}
+
+// Overlays (D and C), drawn in our own type on a separate transparent canvas.
+function drawUI(t) {
+  const c = ui.getContext('2d');
+  c.setTransform(1, 0, 0, 1, 0, 0);
+  c.clearRect(0, 0, pxW, pxH);
+  if (!showDebug && !showCritic) return;
+  c.setTransform(K, 0, 0, K, 0, 0);
+  if (showDebug) {
+    const beat = Math.floor(t / BEAT + 1e-9);
+    const txt = (Math.floor(beat / 4) + 1) + '.' + (beat % 4 + 1) + '  T ' + t.toFixed(2) + '  ED ' + pad4(editionN) +
+      '  ' + (GPU ? 'GPU' : 'CANVAS') + (GPU ? (FINISH ? ' FINISH' : ' CLEAN') : '');
+    const w = measure(txt, 17, 1, 1);
+    c.fillStyle = WHITE; c.fillRect(24, H - 64, w + 32, 44);
+    c.fillStyle = BLACK; c.fillRect(24, H - 64, w + 32, 2);
+    drawText(c, txt, 40, H - 33, 17, 1, 1, BLACK);
+  }
+  if (showCritic && ED) {
+    const lines = [];
+    lines.push(['CRITIC  EDITION ' + pad4(ED.n), '']);
+    lines.push(['SUBSEED ' + ED.seed, '']);
+    lines.push(['ATTEMPT ' + (ED.attempt + 1) + (ED.attempt === 0 ? '  FIRST TRY' : ''), '']);
+    ED.verdict.results.forEach(r => lines.push([r.rule, r.ok ? 'OK' : 'NO']));
+    ED.rejected.slice(-6).forEach(r => lines.push(['REJECTED ' + (r.attempt + 1), r.failed.join(' / ')]));
+    const x = 54, y = 54, lh = 34, wbox = 972;
+    c.fillStyle = WHITE; c.fillRect(x, y, wbox, lines.length * lh + 40);
+    c.fillStyle = BLACK; c.fillRect(x, y, wbox, 4);
+    lines.forEach((ln, i) => {
+      const by = y + 20 + (i + 1) * lh - 6;
+      drawText(c, ln[0], x + 24, by, 17, 1, 1, BLACK);
+      if (ln[1]) drawText(c, ln[1], x + 330, by, 17, ln[1] === 'NO' ? 1 : 1, 1, ln[1] === 'OK' ? BLACK : RED);
+    });
+  }
+}
+
+function frame(now) {
+  if (lastNow === null) lastNow = now;
+  const dt = Math.min(0.1, (now - lastNow) / 1000);
+  lastNow = now;
+  if (playing) {
+    tNow += dt;
+    // While the picture is plain white at the end, compose the next edition.
+    if (tNow > 15.75 && !nextEd) nextEd = makeEdition(editionN + 1);
+    if (tNow >= LOOP) {
+      tNow -= LOOP;
+      editionN += 1;
+      useEdition(nextEd || makeEdition(editionN));
+      nextEd = null;
+    }
+  }
+  drawFrame(tNow);
+  requestAnimationFrame(frame);
+}
+
+addEventListener('keydown', e => {
+  const k = e.key;
+  if (k === ' ') { playing = !playing; e.preventDefault(); }
+  else if (k === 'ArrowRight' || k === 'ArrowLeft') {
+    const b = Math.round(tNow / BEAT) + (k === 'ArrowRight' ? 1 : -1);
+    tNow = ((b * BEAT) % LOOP + LOOP) % LOOP;
+    e.preventDefault();
+  }
+  else if (k === 'd' || k === 'D') showDebug = !showDebug;
+  else if (k === 'c' || k === 'C') showCritic = !showCritic;
+  else if (k === 'f' || k === 'F') FINISH = !FINISH;
+  else if (k === 'n' || k === 'N') { setEdition(editionN + 1); tNow = 0; }
+  else if (k === 'b' || k === 'B') { setEdition(Math.max(1, editionN - 1)); tNow = 0; }
+  drawFrame(tNow);
+});
+
+// Start: try WebGL2 on the view canvas; if it is missing, use a 2D canvas instead.
+GPU = params.get('nogl') ? null : initGPU(view);
+let viewEl = view;
+if (!GPU) {
+  // A canvas that has tried WebGL cannot switch to 2D, so swap in a fresh one.
+  viewEl = document.createElement('canvas');
+  viewEl.id = 'view';
+  view.replaceWith(viewEl);
+  VIEW2D = viewEl.getContext('2d');
+}
+
+// Fit 1080x1350 into the window, centred; render at up to 2 device pixels per CSS pixel.
+function setupAll() {
+  const cs = [viewEl, ui];
+  const s = Math.min(innerWidth / W, innerHeight / H);
+  const cssW = W * s, cssH = H * s, dpr = Math.min(window.devicePixelRatio || 1, 2);
+  pxW = Math.max(1, Math.round(cssW * dpr)); pxH = Math.max(1, Math.round(cssH * dpr));
+  K = pxW / W;
+  for (const c of cs) {
+    c.width = pxW; c.height = pxH;
+    c.style.width = cssW + 'px'; c.style.height = cssH + 'px';
+    c.style.left = (innerWidth - cssW) / 2 + 'px'; c.style.top = (innerHeight - cssH) / 2 + 'px';
+  }
+  for (const name in L) { L[name].canvas.width = pxW; L[name].canvas.height = pxH; }
+  backKey = '';
+  if (GPU) gpuResize();
+  if (ED) prepareWordImages(ED);
+}
+addEventListener('resize', () => { setupAll(); drawFrame(tNow); });
+
+setupAll();
+setEdition(editionN);
+
+// The public API: every picture is a pure function of (t, edition).
+window.seek = t => { tNow = ((t % LOOP) + LOOP) % LOOP; drawFrame(tNow); return tNow; };
+window.edition = n => { setEdition(n); drawFrame(tNow); return ED.n; };
+// Extras for testing from the console.
+window.machine = {
+  pause: () => { playing = false; }, play: () => { playing = true; },
+  finish: on => { FINISH = !!on; drawFrame(tNow); },
+  debug: on => { showDebug = !!on; drawFrame(tNow); },
+  critic: on => { showCritic = !!on; drawFrame(tNow); },
+  gpu: () => !!GPU,
+  // How many of editions a..b pass the critic on their first attempt?
+  criticStats: (a = 1, b = 100) => {
+    let first = 0, total = 0; const failCount = {};
+    for (let n = a; n <= b; n++) {
+      editionCache.delete(n);
+      const ed = makeEdition(n);
+      if (ed.attempt === 0) first++;
+      total += ed.attempt + 1;
+      ed.rejected.forEach(r => r.failed.forEach(f => (failCount[f] = (failCount[f] || 0) + 1)));
+    }
+    return { editions: b - a + 1, firstTry: first, avgAttempts: total / (b - a + 1), failCount };
+  },
+  // Average time to draw one frame, in ms (forces the GPU to finish each frame).
+  bench: (frames = 120) => {
+    const t0 = performance.now(), px = new Uint8Array(4);
+    for (let i = 0; i < frames; i++) {
+      drawFrame((i * 16 / frames) % LOOP);
+      if (GPU) GPU.gl.readPixels(0, 0, 1, 1, GPU.gl.RGBA, GPU.gl.UNSIGNED_BYTE, px);
+    }
+    const ms = (performance.now() - t0) / frames;
+    drawFrame(tNow);
+    return ms;
+  },
+  edition: () => ED,
+};
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
